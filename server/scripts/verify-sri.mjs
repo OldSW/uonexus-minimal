@@ -176,6 +176,13 @@ const pinnedLoader = (() => {
     return m ? m[1] : null;
   } catch { return null; }
 })();
+// 🚨 THE PAGE'S LOADER MUST EXIST (audit 2026-09-15). Its pin in index.html is read as an importmap alias and
+// skipped below, and the manifest reader falls back to directory order - so a missing live loader next to an
+// orphan one verified the orphan's pins and reported "all good" over a page that cannot boot.
+if (pinnedLoader && !statSync(join(root, '_framework', pinnedLoader), { throwIfNoEntry: false })?.isFile()) {
+  console.error(`[verify-sri] FATAL: index.html pins _framework/${pinnedLoader}, which is not in the bundle.`);
+  process.exit(1);
+}
 const fw = extractFrameworkManifest(join(root, '_framework'), pinnedLoader);
 if (fw) {
   const n = Object.keys(fw.map).length;

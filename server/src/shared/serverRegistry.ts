@@ -398,14 +398,53 @@ function validateLogoUrl(raw: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Strip anything that could become markup or confuse a renderer, from a shard's human-facing text.
+ *
+ * Lifted verbatim from the self-service create route so the two cannot drift: angle brackets go
+ * entirely (no tag can survive), C0/C1 control characters and DEL go by code point, and a
+ * description keeps newline and tab while a display name does not.
+ *
+ * ⚠️ NO LENGTH CLAMP HERE ON PURPOSE. The create route slices to 60 and 400 as part of its own
+ * input contract; doing it here as well would silently truncate an operator's yaml, which is a
+ * different decision from "these bytes must be inert" and does not belong in the same function.
+ */
+export function cleanRegistryText(v: string, allowNewlines: boolean): string {
+  let str = typeof v === 'string' ? v : '';
+  str = str.replace(/[<>]/g, '');
+  str = Array.from(str).filter((ch) => {
+    const c = ch.charCodeAt(0);
+    if (c < 0x20) return allowNewlines && (ch === '\n' || ch === '\t');
+    if (c >= 0x7f && c <= 0x9f) return false;
+    return true;
+  }).join('');
+  return str;
+}
+
 function validate(raw: Partial<ServerRecord>, file: string): ServerRecord {
   const id          = asPositiveInt((raw as Record<string, unknown>).id, 'id', file);
   const slug        = asString(raw.slug, 'slug', file);
   if (!SLUG_REGEX.test(slug)) {
     throw new Error(`${file}: slug '${slug}' must match /^[a-z0-9][a-z0-9-]{0,31}$/`);
   }
-  const displayName = asString(raw.displayName, 'displayName', file);
-  const description = typeof raw.description === 'string' ? raw.description : '';
+  // 🚨 SANITISED HERE, WHERE BOTH ADMIN ROUTES PASS, BECAUSE ONE OF THEM DID NOT DO IT.
+  // The self-service CREATE path built these with its own `cleanText` and explained why in a
+  // comment: "defense-in-origin — even a client-side escape that's forgotten later cannot be
+  // exploited because the stored bytes are already inert". The EDIT path
+  // (PUT /api/admin/servers/:slug, reachable by an owner holding servers:write:own) builds its
+  // record with `{ ...existing, ...body }` and calls straight through to here, so an owner could
+  // persist angle brackets by editing a shard AFTER it was approved. The asserted property was
+  // false for half the ways a record can be written -- a security model stated in a comment is
+  // not a property, which is a failure this project has paid for before.
+  //
+  // Putting it in the one function both routes read through is the documented cure: fixing the
+  // two call sites separately is what let them diverge in the first place.
+  //
+  // ⚠️ AND IT RUNS ON LOAD TOO, WHICH IS A FEATURE, NOT A SIDE EFFECT. Every yaml is validated on
+  // every registry load, so anything already persisted through the gap goes inert the next time
+  // the file is read, instead of waiting for someone to notice and edit it.
+  const displayName = cleanRegistryText(asString(raw.displayName, 'displayName', file), false);
+  const description = cleanRegistryText(typeof raw.description === 'string' ? raw.description : '', true);
   const host        = asString(raw.host, 'host', file);
   validateHost(host, file);
   const port        = asInt(raw.port, 'port', file);

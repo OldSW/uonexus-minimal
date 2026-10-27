@@ -61,6 +61,30 @@ import { isSnowflake } from './discordId.js';
 // the shared dev/prod proxy → every branch below is inert there.
 const MINI_AUTOLOGIN = process.env.MINI_AUTOLOGIN === '1';
 
+/**
+ * Is this shard the WEB BACKEND — the one that exists to host minigames?
+ *
+ * 🚨 DELIBERATELY NOT THE SAME QUESTION AS `miniAuto`, and the first draft of this got it wrong.
+ * I wrote one helper returning `MINI_AUTOLOGIN || target.autologin` for both readers, arguing they
+ * must never drift. Then the mutation test said otherwise: dropping the env half broke NOTHING,
+ * because the env is unset everywhere it runs, so the claim was unobservable — and this repo's own
+ * rule is that an assertion with no world in which it fails is not an assertion.
+ *
+ * Reading it again, they really are two questions:
+ *   - the identity builder asks "should I mint a mini account for this connection?" — a container
+ *     can force that on for every shard with MINI_AUTOLOGIN=1, which is what that lever is for;
+ *   - this gate asks "is this shard for minigames only?" — a property of the SHARD, which a
+ *     container-wide test flag has no business answering. Letting the env widen this would make a
+ *     dev proxy with the flag on refuse ordinary play everywhere, which is not a security
+ *     improvement, it is an outage.
+ *
+ * Measured 2026-09-21: `autologin: true` is set on exactly one shard, and MINI_AUTOLOGIN is UNSET
+ * on both production proxies.
+ */
+function isMinigameBackend(target: { autologin?: boolean } | null | undefined): boolean {
+  return !!target?.autologin;
+}
+
 // Deterministic internal account password — MUST match MiniAutoLogin.cs
 // DerivePassword: Base64(HMAC-SHA256(key=WebIdentitySecret, msg=discordId))[:24].
 function deriveMiniPassword(secret: string, discordId: string): string {
@@ -115,7 +139,9 @@ function resolveServerFromReq(req: http.IncomingMessage): ServerRecord | null {
 // Live registry = runmatch + towerdefense only (minigameRegistry.ts). Keep MG_CODES in lockstep:
 // survivalarena/bomberman were orphan entries (in NO registry, achievements, mini _allowedVerbs or
 // client) so MINIGAME_WHITELIST honoured minigames that did not exist — removed 2026-07-21.
-const MG_CODES: Record<string, string> = { runmatch: 'rm', towerdefense: 'td' };
+// 2026-09-19: survivalarena is back, this time as a real minigame (registry, use-case, `.sa` in the mini's
+// _allowedVerbs and a shard starter), with the code the shard's MgAcctCode already maps.
+const MG_CODES: Record<string, string> = { runmatch: 'rm', towerdefense: 'td', survivalarena: 'sa' };
 const MINIGAME_WHITELIST = new Set(Object.keys(MG_CODES));
 /** Short 2-char account/role code for each minigame. Only ever called with a whitelist member
  *  (resolveMinigameFromReq gates it), and the whitelist IS Object.keys(MG_CODES), so the lookup
@@ -163,7 +189,7 @@ function resolveMinigameFromReq(req: http.IncomingMessage): string | null {
 // If the log on the NAS shows an older tag, the docker image cache lied.
 // Force a clean rebuild with:
 //   docker compose build proxy --no-cache && docker compose up -d --force-recreate proxy
-export const PROXY_BUILD_TAG = '2026-09-15T-v1.0.56-audit (An audit of the last three days of changes. Opening a minigame link on a phone builds one client and never a hidden second one. Closing or retrying the minigame bar no longer sweeps the HUD away or leaves a stale lift behind. On the phone the camera pan stays inside what the engine can show and the panned arena draws whole, two-finger gestures are no longer read as taps, and a second finger cannot steer the walking hero. Tower Defense clicks on the web land on the tile and the tower they were aimed at. The release tooling judges a compressed twin by the bytes it decodes to and checks the immutable file promise before a release is published.)';
+export const PROXY_BUILD_TAG = '2026-10-27T-v1.0.62-catchup (a month of Survival Arena work held in dev reaches production with the minigames shard WebSocket gate, and a self-hosted install from a current UO installer gets its art, maps, sound and houses instead of a black screen.)';
 
 // When ModernUO finishes the auth phase it sends 0x8C and immediately FINs
 // the TCP. The proxy used to react by closing the WS with code 1000 right
@@ -1871,6 +1897,33 @@ export class UOProxy {
           cb(false, 403, 'shard pending approval');
           return;
         }
+        // 🚨 AN AUTOLOGIN SHARD IS THE WEB BACKEND, AND ONLY A MINIGAME SESSION BELONGS ON IT.
+        // Measured against production 2026-09-21: `?server=uonexus` returned 101 to a plain browser
+        // request (an invented slug returned 404, so that was a real acceptance, not a blanket
+        // answer). The block above explains why on purpose — an operator-defined `pending` shard is
+        // only HIDDEN from the picker, never unreachable — so until now the whole protection of the
+        // minigames shard was that nobody saw it in a list.
+        //
+        // What that bought an attacker is the part that matters: `autologin` means the proxy
+        // provisions their mini account and injects the identity frame, so a pinned ?server= from a
+        // FULL cuo/tuo client walks that player's minigame character into the world with no input
+        // restrictions, gumps, macros, scripting and agents — and their web-economy items directly
+        // manipulable in game, which is exactly what the bridge exists to prevent.
+        //
+        // The discriminator is clean and already on the wire: main.js appends `minigame=` ONLY when
+        // the bundle is `mini` AND its use-case pins one, so a full client never sends it. Measured
+        // live: of the five use-cases, only the two `-overlay` ones pin a minigame, and the other
+        // three cannot select this shard anyway because it is hidden from the picker they log in
+        // through. Spectators ride the same overlay use-case, so they carry it too.
+        //
+        // ⚠️ GATED ON `autologin` AND THAT IS NOT LAZY COUPLING: the danger comes FROM autologin. A
+        // shard without it cannot log anyone in unattended, so a pinned WS there is just a normal
+        // login prompt. Measured: `autologin: true` is set on exactly one shard.
+        if (isMinigameBackend(target) && !resolveMinigameFromReq(info.req)) {
+          console.warn('[UOProxy] reject upgrade - slug=' + target.slug + ' is a minigame backend and the request pinned no minigame');
+          cb(false, 403, 'minigame session required');
+          return;
+        }
         const ip = clientIpFromReq(info.req);
 
         // v0.3.14: shard cool-down — if the upstream shard recently FINed
@@ -2141,7 +2194,7 @@ export class UOProxy {
     // YAML; the global MINI_AUTOLOGIN env stays as a legacy/test force-on. Operator
     // shards (eternal) leave autologin unset → miniAuto=false → cuo/tuo Discord+guest
     // sessions are NEVER bound to a mini account or 0x80-rewritten.
-    const miniAuto = MINI_AUTOLOGIN || !!target.autologin;
+    const miniAuto = MINI_AUTOLOGIN || isMinigameBackend(target);
     const isMiniDiscord = miniAuto && !!discordSub;
     const isMiniGuest = miniAuto && !discordSub && !!guestSub;
     // Feature #76: when present, the role suffix carries the SHORT minigame code

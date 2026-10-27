@@ -391,7 +391,7 @@ namespace ClassicUO.Game.UI.Gumps
                 }
                 else if (displayAmount == 0)
                 {
-                    prefix = "±";
+                    prefix = "Â±";
                 }
                 else if (displayAmount > 0)
                 {

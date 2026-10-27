@@ -40,6 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { mayReplaceVersion } from './_versionRank.mjs';
 import { applyContentNames } from './framework-names.mjs';
+import { STATIC_FILES, STATIC_DIRS } from './_staticAssets.mjs';
 import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -268,9 +269,8 @@ const WEB_DIRS = ['webidentity', 'cosmetics', 'ui', 'macros'];
 // by purgeWebFromClient(). Kept IN PARITY with the build.bat/build.sh pre-publish
 // strip. NOTE: macros/ is in WEB_DIRS (copied to web/ for macros.html) but is NOT
 // purged from the bundle — the in-game rail imports macros/*.js (game-host).
-const STATIC_FILES = ['uo-background.jpg', 'uofont.ttf', 'Fondamento-Regular.ttf',
-  'legion-engine.js', 'legion-worker.js'];
-const STATIC_DIRS = ['lib', 'macros', 'pyodide'];
+// STATIC_FILES / STATIC_DIRS live in ./_staticAssets.mjs (imported above): publish-minimal.mjs
+// reads the same list to ship them, and a second copy is how the published tree lost them.
 // Copy passes below MIRROR a canonical shared-www subdir, so they must also PRUNE.
 // Without it a built tree only grows: rename or drop an asset and the old file
 // stays. That matters twice over -- tools/deploy-web.bat mirrors client/web with
@@ -342,6 +342,20 @@ function purgeWebFromClient(clientDir) {
 function copyStatic(clientDir) {
   let n = 0;
   purgeWebFromClient(clientDir);
+  // 🚨 A MISSING GAME-HOST ASSET IS A BROKEN TREE, NOT AN OPTIONAL FILE. These loops used to skip
+  // one in silence, so a tree without them -- the published minimal, before it shipped them --
+  // built a bundle with no font, no background, no Legion and no Python, and reported success.
+  // Every bundle needs all of them (that is what the list IS), so the honest answer is to stop.
+  const missing = STATIC_FILES.filter((f) => !fs.existsSync(path.join(SHARED, f)))
+    .concat(STATIC_DIRS.filter((d) => !fs.existsSync(path.join(SHARED, d)) &&
+      // Not `isMini`: that const is declared further down this function, so reading it here throws
+      // (temporal dead zone). node --check and the whole suite pass right over it -- nothing in
+      // either RUNS copyStatic -- which is exactly how it nearly shipped.
+      !(path.basename(clientDir) === 'mini' && fs.existsSync(path.join(MINI_OVERRIDES, d)))).map((d) => d + '/'));
+  if (missing.length) {
+    throw new Error(`build-web: game-host asset(s) missing from ${SHARED}: ${missing.join(', ')} -- ` +
+      'the bundle would build without them and say nothing. See _staticAssets.mjs.');
+  }
   for (const f of STATIC_FILES) {
     const src = path.join(SHARED, f);
     if (!fs.existsSync(src)) continue;

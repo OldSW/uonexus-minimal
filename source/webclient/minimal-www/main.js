@@ -810,6 +810,32 @@ const REQUIRED_FILES = [
   ['multimap.rle',  'multimap.rle'],
   ['skillgrp.mul',  'skillgrp.mul'],
   ['animinfo.mul',  'animinfo.mul'],
+
+  // CURRENT UO INSTALLERS (7.0.x) ship art, gumps, maps and sound as *LegacyMUL.uop and have
+  // NONE of the classic .mul files. On an un-pooled shard -- every self-hosted minimal install,
+  // which has no /manifest by design -- PLANNED is this list verbatim, so a name missing here is a
+  // file never requested and a canvas that stays black. Pooled shards build PLANNED from their
+  // manifest and were never affected, which is why this went unseen. On an older install these
+  // 404 and are skipped like every other cross-era entry (the loading screen counts them).
+  //   - They are only read when IsUOPInstallation is true, which needs mainmisc.uop (above).
+  //   - multicollection.uop is the multi (house / boat) data. Once IsUOPInstallation is true the
+  //     MultiLoader requires it, and its .mul fallback wants multi.mul AND multi.idx, which these
+  //     installs lack -- without it multis load as null on world entry, not at login.
+  //   - Left out ON PURPOSE: string_dictionary.uop (its loader returns when the file is absent)
+  //     and map{0-5}xLegacyMUL.uop (optional; the map loader falls back to the base map). Each
+  //     extra name is one more 404 on every older install, so only names the client needs.
+  // Reported by a self-hoster on rootmancer/uonexus-minimal (PR #1); multicollection.uop added
+  // after reading the C# loaders.
+  ['artlegacymul.uop',     'artlegacymul.uop'],
+  ['gumpartlegacymul.uop', 'gumpartlegacymul.uop'],
+  ['map0legacymul.uop',    'map0legacymul.uop'],
+  ['map1legacymul.uop',    'map1legacymul.uop'],
+  ['map2legacymul.uop',    'map2legacymul.uop'],
+  ['map3legacymul.uop',    'map3legacymul.uop'],
+  ['map4legacymul.uop',    'map4legacymul.uop'],
+  ['map5legacymul.uop',    'map5legacymul.uop'],
+  ['soundlegacymul.uop',   'soundlegacymul.uop'],
+  ['multicollection.uop',  'multicollection.uop'],
 ];
 
 // --- Loader UI -----------------------------------------------------
@@ -3907,7 +3933,7 @@ async function fetchAll() {
   }
 
   // Honest file count, driven by the shard's MANIFEST (not the hardcoded list).
-  // REQUIRED_FILES is a fixed cross-client-era list of exactly 99 known UO files
+  // REQUIRED_FILES is a fixed cross-client-era list of known UO files (99 until the LegacyMUL set)
   // — that is why the loader always read "X / 99". The shard manifest is the real
   // source of truth: it lists exactly the gamefiles THIS shard publishes, which
   // can be FEWER than 99 (a slim shard) or MORE than 99 (custom content / extra

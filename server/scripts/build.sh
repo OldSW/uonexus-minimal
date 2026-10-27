@@ -57,6 +57,20 @@ for proj in classicuo-wasm tazuo-wasm mini-wasm; do
     rm -f "$WEBCLIENT/$proj/wwwroot/README.md"
   fi
 done
+# -- Published minimal tree: no product web layer, so scaffold with the minimal's --------------
+# rootmancer/uonexus-minimal ships the fork source and the MINIMAL web layer, but not shared-www's
+# index.html / main.js / rail.js, which are the full product's. With no web layer at all the
+# compile below leaves no index.html, and verify-sri / framework-names have nothing to read -- so
+# the from-source build the README orders in its step 4 could not finish (issue #2).
+# build-minimal-bundle.mjs re-derives the web layer from minimal-www anyway; this is only the
+# scaffold the compile needs. In the monorepo shared-www always carries index.html: never runs.
+if [ ! -f "$WEBCLIENT/shared-www/index.html" ] && [ -d "$WEBCLIENT/minimal-www" ]; then
+  echo "[build] No product web layer here (published minimal tree) -- using minimal-www for the compile"
+  for proj in classicuo-wasm tazuo-wasm mini-wasm; do
+    mkdir -p "$WEBCLIENT/$proj/wwwroot"
+    cp -r "$WEBCLIENT/minimal-www/." "$WEBCLIENT/$proj/wwwroot/"
+  done
+fi
 # mini (operator 2026-06-27): overlay its own divergent web (main.js/index.html/tbh-music) ON TOP of the
 # shared-www sync. The shared rail.js (one rail, __MINI__-gated) stays; only the mini-specific files override.
 if [ "$CLIENT_NAME" = "mini" ]; then
@@ -222,11 +236,29 @@ dotnet publish "$WASM_WRAPPER_PROJ" \
   $VERSION_FLAG
 
 echo "[build] Copying output to client/..."
-rsync -a --delete \
-  --exclude='gamefiles/' \
-  --exclude='*.br' \
-  --exclude='*.gz' \
-  "$BUILD_TMP/wwwroot/" "$CLIENT/"
+# 🚨 rsync IS NOT EVERYWHERE, AND THIS LINE USED TO ASSUME IT. Git Bash for Windows ships without it,
+# so a Windows self-hoster compiled for ten minutes and then died here with "rsync: command not
+# found" -- exit 127, after the slow part had already succeeded. Found running README step 1
+# verbatim in a fresh published tree (rootmancer/uonexus-minimal issue #2). The two syncs near the
+# top of this file already fall back to cp; this one did not.
+#
+# The fallback has to be FAITHFUL, not a bare `cp -r`: rsync --delete removes what the new build no
+# longer produces (stale fingerprinted names, which would otherwise ship), while keeping gamefiles/
+# and the .br / .gz twins that live only in client/. Files only; an empty directory left behind is
+# harmless.
+mirror_into() {  # mirror_into SRC DST  ==  rsync -a --delete, keeping gamefiles/ *.br *.gz in DST
+  local src="$1" dst="$2"
+  if command -v rsync &>/dev/null; then
+    rsync -a --delete --exclude='gamefiles/' --exclude='*.br' --exclude='*.gz' "$src/" "$dst/"
+    return
+  fi
+  mkdir -p "$dst"
+  (cd "$dst" && find . -mindepth 1 -path ./gamefiles -prune -o -type f ! -name '*.br' ! -name '*.gz' -print) |
+    while IFS= read -r f; do [ -e "$src/$f" ] || rm -f "$dst/$f"; done
+  (cd "$src" && find . -mindepth 1 -path ./gamefiles -prune -o -type f ! -name '*.br' ! -name '*.gz' -print) |
+    while IFS= read -r f; do mkdir -p "$dst/$(dirname "$f")" && cp -p "$src/$f" "$dst/$f"; done
+}
+mirror_into "$BUILD_TMP/wwwroot" "$CLIENT"
 
 # Preserve gamefiles placeholder. If the deployer has symlinked client/gamefiles
 # to the real UO data tree (recommended on Linux — see README "Linux deployment"),

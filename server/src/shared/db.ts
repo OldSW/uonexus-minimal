@@ -606,7 +606,15 @@ db.exec(`
     ref          TEXT NOT NULL DEFAULT '',
     reason       TEXT NOT NULL,                 -- buy|cancel|shop|admin
     created_at   INTEGER NOT NULL,
-    delivered_at INTEGER
+    delivered_at INTEGER,
+    -- 🚨 PARKED, which is neither delivered nor due. The shard can answer a delivery with a
+    -- statement about the REQUEST ("no such type") that will read identically forever, and
+    -- such a row can never succeed. Left due, it costs a bridge write on every connect and —
+    -- because the drain only looks at the OLDEST few — eight of them permanently occupy the
+    -- window and starve every later delivery for that player. Parking takes it out of the
+    -- queue WITHOUT marking it delivered: the row survives, so property somebody paid for is
+    -- never silently destroyed, and it can be un-parked by hand once the cause is fixed.
+    parked_at    INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_item_deliveries ON item_deliveries(sub, delivered_at);
 
@@ -883,6 +891,15 @@ if (!_colExists('nicknames', 'paperdoll_body')) {
 if (!_colExists('item_deliveries', 'ref')) {
   try { db.exec("ALTER TABLE item_deliveries ADD COLUMN ref TEXT NOT NULL DEFAULT ''"); console.log('[db] item_deliveries.ref added'); }
   catch (e) { console.error('[db] could not add item_deliveries.ref:', (e as Error).message); }
+}
+
+// item_deliveries.parked_at for DBs created before 2026-09-21. See the column comment: without
+// it a permanently-invalid row stays due forever, and eight of them fill the per-connect window
+// and starve every later delivery for that player. Nullable with no default, so every existing
+// row reads as not parked — which is what they are.
+if (!_colExists('item_deliveries', 'parked_at')) {
+  try { db.exec('ALTER TABLE item_deliveries ADD COLUMN parked_at INTEGER'); console.log('[db] item_deliveries.parked_at added'); }
+  catch (e) { console.error('[db] could not add item_deliveries.parked_at:', (e as Error).message); }
 }
 
 // Add card_listings.foil/aura to pre-existing DBs (v0.9.87, operator 2026-06-19): a listing
