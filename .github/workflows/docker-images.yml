@@ -1,0 +1,66 @@
+name: Docker images
+
+# Builds the client / proxy / nginx targets of the root Dockerfile and pushes them to GHCR as
+#   ghcr.io/<owner>/<repo>-client | -proxy | -nginx
+# The Dockerfile clones this repository itself, at the ref that triggered the run (branch or tag),
+# so the images always match the pushed source.
+
+on:
+  push:
+    branches: [main, mac-fixes]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [client, proxy, nginx]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}-${{ matrix.target }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UONEXUS_REPO=${{ github.server_url }}/${{ github.repository }}.git
+            UONEXUS_REF=${{ github.ref_name }}
+            UONEXUS_REV=${{ github.sha }}
+          # A branch name never changes, so UONEXUS_REV (the commit) is what busts the cache of the
+          # git clone layer; the client compile after it is the 10+ minute step.
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
