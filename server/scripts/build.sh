@@ -38,6 +38,19 @@ else
   BUILD_TMP="$REPO/.build/classicuo-wasm"
   CLIENT="$REPO/client/cuo"
 fi
+
+# A client this checkout does not carry must say so, not fail deep inside MSBuild. The public
+# uonexus-minimal repository ships this script unchanged but only the cuo and tuo wrappers, so
+# CLIENT_NAME=mini there reached `dotnet publish` with a project that does not exist.
+if [ ! -f "$WASM_WRAPPER_PROJ" ]; then
+  echo "[build] ERROR: CLIENT_NAME=$CLIENT_NAME needs $WASM_WRAPPER_PROJ, which is not in this checkout." >&2
+  if [ "$CLIENT_NAME" = "mini" ]; then
+    echo "[build]        The public uonexus-minimal repository builds cuo and tuo only." >&2
+  else
+    echo "[build]        This checkout looks incomplete - re-clone it, or run: git submodule update --init --recursive" >&2
+  fi
+  exit 1
+fi
 echo "[build] CLIENT_NAME=$CLIENT_NAME   out=$CLIENT"
 
 # ── shared-www sync (2026-06-10 web dedup) ────────────────────────────────────

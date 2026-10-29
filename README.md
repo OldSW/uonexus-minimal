@@ -341,7 +341,7 @@ uses. Everything here is optional — the install runs with the four.
 |---|---|---|
 | `PORT` | `8080` | The port on **your machine**. Maps to nginx's port 80 inside the container. |
 | `SERVER_NAME` | — | The name shown on the landing page. Cosmetic. |
-| `PUBLIC_ORIGINS` | — | Comma-separated extra origins your install is reached at, e.g. `https://uo.example.com`. Unset is fine and is the usual case: the boot log says `origin checks accept same-origin only`, which is exactly right when the page and the API share a hostname. You need it only when they do not — a separate API subdomain, or an embed on another site. |
+| `PUBLIC_ORIGINS` | — | Comma-separated extra origins your install is reached at, e.g. `https://uo.example.com`. Unset is fine and is the usual case: the boot log says `origin checks accept same-origin only`, which is exactly right when the page and the API share a host AND PORT -- they are compared together, which is why nginx has to forward the port and not just the name. You need it only when they do not — a separate API subdomain, or an embed on another site. |
 | `COOKIE_DOMAIN` | — | Set only if you serve the client and the API from different subdomains of one domain. Wrong values break sign-in without a message. |
 | `TRUST_PROXY_HOPS` | `0` | How many reverse proxies sit in front. **Getting this wrong breaks rate limiting**, in whichever direction you err: too low and every player looks like one address, so one player's traffic throttles everyone; too high and each player can appear to be a fresh address by sending a header. Behind Cloudflare or one nginx, `1`. |
 
