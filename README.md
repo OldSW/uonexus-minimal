@@ -306,11 +306,14 @@ mkdir -p gamefiles/myshard
 
 **File names must be lower case.** The client asks for `artlegacymul.uop`, and the official
 installer writes `artLegacyMUL.uop`; nginx on Linux is case-sensitive, so a mixed-case name is
-never found by the client. The optional compression script warns when it skips one. After copying,
-lower-case the names, leaving `MapsCache` alone:
+never found by the client. The asset worker logs a `WARNING` for each one (so does the optional
+compression script). After copying, lower-case the names at every depth (the client asks for
+`music/digital/config.txt` too), leaving `MapsCache` and dotfiles alone and never overwriting a file:
 
 ```bash
-cd gamefiles/myshard && for f in *; do [ -f "$f" ] && l=$(printf %s "$f" | tr A-Z a-z) && [ "$f" != "$l" ] && mv -n "$f" "$l"; done
+cd gamefiles/myshard && LC_ALL=C find . -depth -mindepth 1 -name '*[A-Z]*' \
+  ! -path './MapsCache*' ! -path '*/.*' ! -path '*@eaDir*' \
+  -exec sh -c 'for p; do mv -n "$p" "${p%/*}/$(printf %s "${p##*/}" | tr A-Z a-z)"; done' sh {} +
 ```
 
 **4. Build the client** — *skip this if you downloaded a release; `client/` is already there.*

@@ -44,10 +44,11 @@ function parseArgs(argv) {
 }
 
 async function listFiles(dir) {
-  // v0.3.19 the gamefiles tree is canonicalised to lowercase via the
-  // gamefiles-lowercase.sh one-shot, but we still defensively skip any
-  // mixed-case stragglers in case the operator hasn't run that
-  // migration yet on a fresh deploy.
+  // Only lower-case names are compressed: a mixed-case file is never
+  // requested by the client, so its twin would be dead weight. Skipped
+  // ones are warned about below, never dropped silently. (Hosted, the
+  // tree is normalised by gamefiles-lowercase.sh / asset-worker.mjs;
+  // the public minimal ships neither, so there the warning is all.)
   const ents = await readdir(dir, { withFileTypes: true });
   const out = [];
   for (const e of ents) {

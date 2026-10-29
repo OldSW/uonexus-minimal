@@ -79,6 +79,32 @@ function walk(dir, out = []) {
   return out;
 }
 
+/**
+ * Names the client will never ask for: anything with upper case in its relative path.
+ *
+ * The client requests every game file lower case and nginx on Linux is case-sensitive, so the
+ * official installer's `artLegacyMUL.uop` is a 404 for the player -- while every other pass here
+ * happily compresses and hashes it, and the logs look healthy. Warn, do not rename: these are the
+ * self-hoster's files (the README carries the one-line rename). Once per name per process, or a
+ * 120 s interval would bury the log.
+ *
+ * Dotfiles are skipped: rsync writes its in-flight temporaries as `.name.XXXXXX`, and our own
+ * sidecar is one too. MapsCache is already out of walk(), capitalised on purpose.
+ */
+const warnedCase = new Set();
+
+function casePass(dir) {
+  for (const abs of walk(dir)) {
+    const rel = path.relative(dir, abs).split(path.sep).join('/');
+    if (rel.split('/').some((seg) => seg.startsWith('.'))) continue;
+    if (rel.endsWith('.br') || rel.endsWith('.tmp')) continue;   // derived, follow their source
+    if (rel === rel.toLowerCase() || warnedCase.has(rel)) continue;
+    warnedCase.add(rel);
+    log(`WARNING ${rel}: not lower case. The client asks for ${rel.toLowerCase()} and nginx is ` +
+      'case-sensitive, so it may never be found. Rename it (README: "File names must be lower case").');
+  }
+}
+
 async function compressPass(dir) {
   let made = 0;
   for (const src of walk(dir)) {
@@ -212,6 +238,7 @@ async function tick() {
     log(`no gamefiles directory yet (root=${ROOT} slug=${SLUG || '(unset)'}) — waiting`);
     return;
   }
+  casePass(dir);
   const baked = await mapPass(dir);
   const hashed = hashPass(dir);
   const made = await compressPass(dir);
