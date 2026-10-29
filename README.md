@@ -304,6 +304,15 @@ mkdir -p gamefiles/myshard
 # copy your .mul / .uop set into it
 ```
 
+**File names must be lower case.** The client asks for `artlegacymul.uop`, and the official
+installer writes `artLegacyMUL.uop`; nginx on Linux is case-sensitive, so a mixed-case name is
+never found by the client. The optional compression script warns when it skips one. After copying,
+lower-case the names, leaving `MapsCache` alone:
+
+```bash
+cd gamefiles/myshard && for f in *; do [ -f "$f" ] && l=$(printf %s "$f" | tr A-Z a-z) && [ "$f" != "$l" ] && mv -n "$f" "$l"; done
+```
+
 **4. Build the client** — *skip this if you downloaded a release; `client/` is already there.*
 
 ```bash

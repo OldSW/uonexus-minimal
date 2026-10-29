@@ -53,7 +53,15 @@ async function listFiles(dir) {
   for (const e of ents) {
     if (!e.isFile() || e.isSymbolicLink()) continue;
     if (!EXT_MATCH.test(e.name)) continue;
-    if (e.name !== e.name.toLowerCase()) continue;  // skip case-variants
+    if (e.name !== e.name.toLowerCase()) {
+      // The client asks for game files in lower case (UOFileManager lowercases the name) and nginx
+      // on Linux is case-sensitive, so a mixed-case file such as artLegacyMUL.uop is a 404 for
+      // the player AND gets no .br twin from this script. Say so, once per file, instead of
+      // skipping it silently -- a silent skip reads as success.
+      console.warn(`[precompress] SKIPPED ${e.name}: not lower case, so the client will not find it. ` +
+        'Rename it to lower case (e.g. artLegacyMUL.uop -> artlegacymul.uop).');
+      continue;
+    }
     out.push(e.name);
   }
   return out.sort();
