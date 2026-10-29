@@ -708,7 +708,11 @@ Releases are cut per version. To move to a newer one, replace the tree and keep 
 
 - **keep** your `.env`, `servers/*.yaml`, `gamefiles/` and `data/` — none of them are in a release
 - **replace** `client/`, `server/` and the compose file
-- `docker compose -f docker-compose.minimal.yml up -d --force-recreate`
+- `docker compose -f docker-compose.minimal.yml up -d --build --force-recreate`
+
+⚠️ **`--build` is not optional.** The proxy and the asset worker run from an image built from
+`server/`, not from the files on disk. Without `--build` they keep running the previous release's
+code, however new `server/` looks.
 
 ⚠️ **Never overwrite `client/minimal/config.json` with the one from a release.** That file holds the
 shard *you* configured. Releases ship `config.example.json` beside it for exactly this reason, and a
