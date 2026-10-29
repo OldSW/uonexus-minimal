@@ -347,7 +347,7 @@ rm -f "$CLIENT/legion-engine.js.br" "$CLIENT/legion-worker.js.br"
 # de TazUO en rojo).
 echo "[build] Restoring raw pyodide/*.js (plain-named, never fingerprinted)..."
 mkdir -p "$CLIENT/pyodide"
-cp -f "$WEBCLIENT/shared-www/pyodide/." "$CLIENT/pyodide/" -r
+cp -rf "$WEBCLIENT/shared-www/pyodide/." "$CLIENT/pyodide/"
 if [ ! -f "$CLIENT/pyodide/pyodide.js" ]; then
   echo "[build] ERROR: raw pyodide/pyodide.js restore failed"
   exit 1
