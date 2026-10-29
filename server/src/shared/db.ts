@@ -61,9 +61,13 @@ export const db = new DatabaseSync(DB_FILE);
 //      would run TWICE, concurrently, on two processes started together by
 //      `up -d proxy proxy-web`. Such a migration needs an explicit owner: gate it on
 //      OWNS_JOBS from proxyRole.ts, the same way the scheduled jobs are gated.
+// 🚨 busy_timeout FIRST (audit 2026-10-29). It was third, so the journal_mode switch ran with a
+// timeout of zero: when both processes start together (`up -d proxy proxy-web`, first boot, or
+// right after the other one took a write lock), the WAL pragma met the lock and threw
+// "database is locked" at module load — the whole process crashed instead of waiting 4 s.
+db.exec('PRAGMA busy_timeout = 4000');
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA synchronous = NORMAL');
-db.exec('PRAGMA busy_timeout = 4000');
 db.exec('PRAGMA foreign_keys = ON');
 
 // REENTRANT (audit hardening 2026-06-25): a top-level call is a real IMMEDIATE

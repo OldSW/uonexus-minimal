@@ -15,7 +15,7 @@
 // (signature + IHDR) and bounded in bytes + pixel dimensions before it touches
 // disk. validatePng is pure and unit-tested.
 
-import express, { type Application, type Request, type Response, type RequestHandler } from 'express';
+import express, { type Application, type Request, type Response, type NextFunction, type RequestHandler } from 'express';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
@@ -121,9 +121,17 @@ function attachImageRoutes(app: Application, kind: 'logo' | 'banner', dir: strin
   });
 
   // POST /api/admin/servers/:slug/<kind> — upload a PNG (raw image/png body).
+  // 🚨 LIMITER AND AUTH BEFORE THE BODY (audit 2026-10-29). express.raw ran FIRST, so anyone could
+  // make the process buffer up to maxBytes per request before being told 401 — and the limiter,
+  // placed after it, could not even count the request until the bytes had arrived.
   app.post(`/api/admin/servers/:slug/${kind}`,
-    express.raw({ type: ['image/png', 'application/octet-stream'], limit: maxBytes }),
     adminLimiter,
+    (req: Request, res: Response, next: NextFunction) => {
+      if (!requireSafeOrigin(req, res)) return;
+      if (!resolveAdmin(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+      next();
+    },
+    express.raw({ type: ['image/png', 'application/octet-stream'], limit: maxBytes }),
     async (req, res) => {
       const slug = String(req.params.slug ?? '').trim().toLowerCase();
       if (!requireSafeOrigin(req, res)) return;

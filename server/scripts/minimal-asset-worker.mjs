@@ -26,7 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createBrotliCompress, constants } from 'node:zlib';
-import { createHash } from 'node:crypto';
+import { sha256FileSync } from './_hashFile.mjs';
 import { pipeline } from 'node:stream/promises';
 import { bakeMap, pruneOtherGenerations } from './bake-worldmap.mjs';
 
@@ -214,7 +214,7 @@ function hashPass(dir) {
     const was = prev[key];
     if (was && was.size === st.size && was.mtime === st.mtimeMs) { next[key] = was; continue; }
     try {
-      const h = createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+      const h = sha256FileSync(abs);   // chunked: a multi-GiB .uop must not take the whole file into memory
       next[key] = { h, size: st.size, mtime: st.mtimeMs };
       hashed++;
     } catch (e) {

@@ -1662,7 +1662,7 @@ async function _discordApplySettings() {
     // location.hostname (see WASM_UO_WS_URL). Restoring a saved wsHost would
     // re-introduce the stored-MITM vector (crafted ?wsHost=evil.com link).
     for (const key of ['wsPort', 'wsPath', 'encrypt']) {
-      if (typeof settings[key] === 'string' && settings[key] && !params.has(key)) {
+      if (typeof settings[key] === 'string' && settings[key] && !params.has(key) && wsParamOk(key, settings[key])) {
         params.set(key, settings[key]);
         changed = true;
       }
@@ -2360,6 +2360,15 @@ async function discordInit() {
   });
 }
 
+/** The value rule for the two saved WS settings, shared by the URL builder, the save and the
+ *  restore (and mirrored server-side in auth.ts SETTING_VALUE_OK). A port is digits in range; a
+ *  path starts with "/", which ends the URL authority so nothing after it can name a host. */
+function wsParamOk(key, v) {
+  if (key === 'wsPort') return /^\d{1,5}$/.test(v) && Number(v) >= 1 && Number(v) <= 65535;
+  if (key === 'wsPath') return /^\/[A-Za-z0-9._~/%-]{0,127}$/.test(v);
+  return true;
+}
+
 async function discordSaveSettings() {
   if (!_discordUser) return;
   try {
@@ -2370,7 +2379,7 @@ async function discordSaveSettings() {
     // game-WS MITM. The host is locked to location.hostname anyway.
     for (const key of ['wsPort', 'wsPath']) {
       const v = qs.get(key);
-      if (v) payload[key] = v;
+      if (v && wsParamOk(key, v)) payload[key] = v;
     }
     // Always save as string ID ("none", "old", ...) so the picker can
     // round-trip it via its <option value="..."> attributes.
@@ -6045,9 +6054,17 @@ const { runMain, getAssemblyExports } = await dotnet
     // + password the user types — at an attacker host. So IGNORE any wsHost
     // param/saved value; lock the host to location.hostname. (wsPort/wsPath
     // stay overridable — they're same-host, no cross-host redirect.)
+    // SECURITY (2026-10-29): wsPort/wsPath are VALIDATED too, and the finished URL must still name
+    // this host. Locking the host alone was not enough — the URL below is concatenated, so
+    // ?wsPort=443@evil.example built wss://<host>:443@evil.example/ws, whose HOST is evil.example
+    // (the "<host>:443" part becomes userinfo), and the pagehide auto-save kept it for every visit.
+    // wsParamOk is the same rule the server applies to saved values.
     const host = location.hostname;
-    const port = qs.get('wsPort') ?? (location.port || (location.protocol === 'https:' ? '443' : '80'));
-    const path = qs.get('wsPath') ?? '/ws';
+    const defPort = location.port || (location.protocol === 'https:' ? '443' : '80');
+    const qPort = qs.get('wsPort');
+    const qPath = qs.get('wsPath');
+    const port = qPort != null && wsParamOk('wsPort', qPort) ? qPort : defPort;
+    const path = qPath != null && wsParamOk('wsPath', qPath) ? qPath : '/ws';
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     // the shard from the registry on upgrade. Single-server deploys still
     // work without this — the proxy auto-selects the only registered
@@ -6068,7 +6085,10 @@ const { runMain, getAssemblyExports } = await dotnet
         if (_sp) { tail += (tail.includes('?') ? '&' : '?') + 'spectate=' + encodeURIComponent(_sp); window.__uoSpectate = true; }
       }
     } catch { /* no spectate */ }
-    return `${scheme}://${host}:${port}${path}${tail}`;
+    const wsUrl = `${scheme}://${host}:${port}${path}${tail}`;
+    try { if (new URL(wsUrl).hostname === host) return wsUrl; } catch { /* malformed: fall through */ }
+    console.warn('[ws] refusing a WS URL that does not point at this host; using the default');
+    return `${scheme}://${host}:${defPort}/ws${tail ? '?' + tail.slice(1) : ''}`;
   })())
   // v0.5.5: CUO_SHARD_BASE / CUO_USER_KIND through the .NET boot-config
   // env — NOT Module.ENV, which never reaches the MT deputy worker where

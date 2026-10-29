@@ -23,7 +23,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'node:crypto';
 import type { Server, IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { clientIpFromReq } from './clientIp.js';
+import { clientIpFromReq, ipBucketKey } from './clientIp.js';
 
 interface Peer {
   id: string;
@@ -250,7 +250,7 @@ export function attachUoamHub(server: Server, opts: UoamHubOptions = {}): void {
     // hop, failing closed to the socket address — so a logged-in user can't spoof
     // the XFF first-entry to make every connection look like a fresh IP and defeat
     // the per-IP cap. The cap is this hub's main connection-flood DoS control.
-    const ip = clientIpFromReq(req);
+    const ip = ipBucketKey(clientIpFromReq(req));   // an IPv6 /64 is one subscriber (M3)
     // v0.9.132 (audit 2026-06-21): RESERVE the per-IP slot synchronously, BEFORE the
     // async handleUpgrade handshake. Previously the count was only bumped inside
     // onConnection (post-handshake), so N concurrent upgrades from one IP all

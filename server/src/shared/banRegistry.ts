@@ -126,8 +126,10 @@ let loadedStamp: string | null = null;
 /** mtime+size of the ban file, or null when it does not exist. */
 function fileStamp(): string | null {
   try {
-    const st = fs.statSync(filePath());
-    return `${st.mtimeMs}:${st.size}`;
+    // throwIfNoEntry: false — this now runs on every verifyJWT (bans apply to web sessions too), and
+    // with no bans file a throwing stat built an exception per request (double check 2026-10-29).
+    const st = fs.statSync(filePath(), { throwIfNoEntry: false });
+    return st ? `${st.mtimeMs}:${st.size}` : null;
   } catch { return null; }
 }
 

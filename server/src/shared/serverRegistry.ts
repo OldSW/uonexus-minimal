@@ -215,6 +215,17 @@ export interface PublicServer {
 // drift" — but this one was not exported, so its slug check fell back to a local id pattern that
 // allowed 40 chars against this 32. The promise only held for the fields that were reachable.
 export const SLUG_REGEX  = /^[a-z0-9][a-z0-9-]{0,31}$/;
+/**
+ * 🚨 A NEW slug may not end in `-web` (audit 2026-10-29). The gamefile bridges are named after the
+ * slug — `override-<slug>/` for overrides — and the asset worker treats any `<x>-web` directory
+ * whose `<x>` exists as x's brotli twin. So registering `<victim>-web` made the attacker's override
+ * bridge the SAME directory as the victim's twin: planted `.br` + sidecar pairs were pooled into
+ * the victim's overrides, and "revert all" deleted the victim's twin. Checked where a slug is
+ * BORN (admin create, self-service, rename), not in SLUG_REGEX, so an existing record still loads.
+ */
+export function isReservedSlug(slug: string): boolean {
+  return /-web$/.test(slug);
+}
 
 /**
  * May this shard appear in somebody's picker?

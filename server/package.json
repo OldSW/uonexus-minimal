@@ -9,14 +9,14 @@
     "start:minimal": "node --experimental-sqlite --no-warnings=ExperimentalWarning --import tsx/esm src/minimal/index.ts"
   },
   "dependencies": {
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "cors": "^2.8.5",
     "esbuild": "^0.28.1",
-    "express": "^4.22.2",
+    "express": "^4.22.3",
     "pngjs": "^7.0.0",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.5",
     "tsx": "^4.23.1",
-    "undici": "^8.5.0",
+    "undici": "^8.12.3",
     "ws": "^8.18.0",
     "yaml": "^2.6.0"
   },

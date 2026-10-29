@@ -6,6 +6,7 @@ import { db, migrateJsonOnce } from './db.js';
 import { writeFileAtomic, writeFileAtomicAsync } from './atomicJson.js';
 import { withFileLockSync } from './fileLock.js';
 import { OWNS_JOBS } from './proxyRole.js';
+import { findActiveBan } from './banRegistry.js';
 import { eraseUserData } from './userData.js';
 import { deleteAllScreenshots } from './screenshotStore.js';
 import { deleteUserLogo } from './userLogoStore.js';
@@ -46,7 +47,7 @@ export function setIdentitySideEffect(fn: IdentitySideEffect | null): void {
   _onIdentity = fn;
   console.log(`[registry] identity side effect: ${fn ? 'registered' : 'cleared'}`);
 }
-import { clientIpFromReq } from './clientIp.js';
+import { clientIpFromReq, ipBucketKey } from './clientIp.js';
 import type { Request, Response } from 'express';
 import {
   DISCORD_CLIENT_ID,
@@ -206,15 +207,52 @@ loadLoggedOutAt();
 _loStamp = loFileStamp();
 /** Test seam: force the next read to consult the file. Never called in production. */
 export function _forceLoggedOutAtRecheck(): void { _loCheckedAt = 0; }
-function persistLoggedOutAt(): void {
+function persistLoggedOutAt(changedSub?: string): void {
   try {
     fs.mkdirSync(path.dirname(LOGGED_OUT_AT_FILE), { recursive: true });
-    const tmp = `${LOGGED_OUT_AT_FILE}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(loggedOutAt), null, 2), 'utf8');
-    fs.renameSync(tmp, LOGGED_OUT_AT_FILE);
-    // Our own write is not a foreign change (same reasoning as banRegistry.persist).
-    _loStamp = loFileStamp();
-    _loCheckedAt = Date.now();
+    // 🚨 APPLY THE CHANGE TO THE FILE, UNDER ITS LOCK — never overwrite it with this process's map
+    // (audit 2026-10-29, L1). Both processes write: the game one for logout/logout-all (/auth/), the
+    // web one when an admin erases a user. Each wrote its in-memory map wholesale, and that map is
+    // only refreshed from disk at most once a second inside verifyJWT, so a "log out everywhere"
+    // recorded by one process could be erased by the other's next write — reproduced with two
+    // processes: the stolen token went from refused back to VALID. Now the file is the base, only
+    // `changedSub` is raised (newest instant wins), entries no token can still predate are pruned
+    // in the same pass, and memory becomes exactly what was written.
+    const now = Math.floor(Date.now() / 1000);
+    const discordCutoff = now - COOKIE_MAX_AGE - 86400;
+    const guestCutoff = now - GUEST_COOKIE_MAX_AGE - 86400;
+    withFileLockSync(LOGGED_OUT_AT_FILE, () => {
+      const merged = new Map<string, number>();
+      let raw: string | null = null;
+      try { raw = fs.readFileSync(LOGGED_OUT_AT_FILE, 'utf8'); } catch { /* missing: nothing recorded yet */ }
+      try {
+        if (raw !== null) {
+          for (const [sub, ts] of Object.entries(JSON.parse(raw) as Record<string, unknown>)) {
+            if (typeof ts === 'number' && Number.isFinite(ts)) merged.set(sub, ts);
+          }
+        }
+      } catch {
+        // Unparseable: keep what this process knows rather than drop every recorded logout.
+        for (const [sub, ts] of loggedOutAt) merged.set(sub, ts);
+      }
+      if (changedSub !== undefined) {
+        const mine = loggedOutAt.get(changedSub);
+        if (mine !== undefined && mine > (merged.get(changedSub) ?? -Infinity)) merged.set(changedSub, mine);
+      }
+      for (const [sub, ts] of merged) {
+        if (ts < (sub.startsWith('guest-') ? guestCutoff : discordCutoff)) merged.delete(sub);
+      }
+      const tmp = `${LOGGED_OUT_AT_FILE}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(merged), null, 2), 'utf8');
+      fs.renameSync(tmp, LOGGED_OUT_AT_FILE);
+      // Stamped INSIDE the lock: taken after release, another process's write landing in between
+      // would be recorded as ours and never re-read (double check 2026-10-29).
+      _loStamp = loFileStamp();
+      _loCheckedAt = Date.now();
+      loggedOutAt.clear();
+      for (const [sub, ts] of merged) loggedOutAt.set(sub, ts);
+    });
+    // Our own write is not a foreign change (same reasoning as banRegistry.persist) — stamped above.
   } catch (e) {
     console.error('[Auth] failed to persist logged-out-at:', (e as Error).message);
   }
@@ -230,13 +268,12 @@ function persistLoggedOutAt(): void {
 // entry), the JSON file grew unboundedly between sweeps. Now guest
 // subs use the 24h+1d budget so they age out within ~48h instead of
 // 31d.
-// 🚨 ONE OWNER, because this job WRITES THE WHOLE FILE. It ran on both processes, and the web one
-// never reloaded — so once a day it could rewrite logged-out-at.json from its boot-time snapshot
-// and erase every logout recorded since. A pruner that deletes expired entries is harmless; a
-// pruner that persists a stale map is a kill switch being switched back off.
-//
-// OWNS_JOBS is the game process, which is also the only WRITER (both logout verbs are /auth/), so
-// the owner and the writer are the same side by construction rather than by coincidence.
+// 🚨 ONE OWNER. It ran on both processes, and the web one never reloaded — so once a day it could
+// rewrite logged-out-at.json from its boot-time snapshot and erase every logout recorded since.
+// Since L1 (audit 2026-10-29) every write merges with the file under its lock and prunes in the same
+// pass, so no writer can undo another's logout; the pruner stays on OWNS_JOBS (the game process,
+// which records both logout verbs) simply so the daily pass runs once. The web process writes too,
+// when an admin erases a user.
 if (OWNS_JOBS) {
   setInterval(() => {
     refreshLoggedOutAt(Date.now() + LO_RECHECK_MS);   // never prune from a stale copy
@@ -246,9 +283,9 @@ if (OWNS_JOBS) {
     let mutated = false;
     for (const [sub, ts] of loggedOutAt) {
       const cutoff = sub.startsWith('guest-') ? guestCutoff : discordCutoff;
-      if (ts < cutoff) { loggedOutAt.delete(sub); mutated = true; }
+      if (ts < cutoff) { mutated = true; break; }
     }
-    if (mutated) persistLoggedOutAt();
+    if (mutated) persistLoggedOutAt();   // prunes inside, merged with the file under its lock
   }, 24 * 60 * 60 * 1000).unref();
 }
 
@@ -275,7 +312,8 @@ export function issueJWT(payload: Record<string, unknown>, ttlSeconds = COOKIE_M
   return `${header}.${body}.${sig}`;
 }
 
-export function verifyJWT(token: string): Record<string, unknown> | null {
+let _banReadWarned = false;
+export function verifyJWT(token: string, opts: { ignoreBan?: boolean } = {}): Record<string, unknown> | null {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [header, body, sig] = parts;
@@ -344,6 +382,24 @@ export function verifyJWT(token: string): Record<string, unknown> | null {
         const iat = typeof payload.iat === 'number' ? payload.iat : 0;
         if (iat < lo) return null;
       }
+      // 🚨 A BANNED ACCOUNT HAS NO SESSION (audit 2026-10-29, M1). Bans were enforced only on the
+      // game WebSocket upgrade, so a blocked user kept the whole portal — comments, market, cards,
+      // settings, gamefile downloads through /auth/verify — and could simply log in again for a
+      // fresh cookie. Checked here, where every web path and the WS upgrade already verify, so no
+      // route can forget it. The registry is cached and stat-gated, and re-read across processes.
+      //
+      // ignoreBan: the game WebSocket gate reads the token WITH the ban so it can refuse it as a ban
+      // (403 'banned', and the live-session sweep can match it). Through the plain call the banned
+      // cookie read as no cookie at all, and the gate let the player in as ANONYMOUS on any shard
+      // allowing guests (double check 2026-10-29).
+      // A broken bans file must not log everybody out: the WS gate (which calls findActiveBan
+      // directly) still fails closed; a web session fails open with one log line.
+      if (!opts.ignoreBan) {
+        let banned = false;
+        try { banned = !!findActiveBan({ discordId: payload.sub }); }
+        catch (e) { if (!_banReadWarned) { _banReadWarned = true; console.error('[Auth] ban registry unreadable — web sessions not checked against bans:', (e as Error).message); } }
+        if (banned) return null;
+      }
     }
     return payload;
   } catch { return null; }
@@ -392,6 +448,29 @@ function revokeJWT(token: string): void {
   }
 }
 
+/**
+ * True when a token that WAS valid has been revoked since: logout / logout-all, a hard secret
+ * rotation, a revoked jti, or an active ban. Expiry is deliberately NOT revocation — a long game
+ * session is not cut because the cookie behind it aged out mid-play.
+ *
+ * 🚨 (audit 2026-10-29, L2). The game socket checks the JWT once, at upgrade, and the live-session
+ * sweep only looked at bans. So "log out everywhere" — whose promise is that every other tab is
+ * dead — left a stolen cookie's game session playing (auto-logged into the victim's character on the
+ * minigames shard), and so did an account erasure. UOProxy's 30 s sweep now asks this.
+ */
+export function isSessionRevoked(payload: Record<string, unknown>): boolean {
+  const sub = payload.sub;
+  if (typeof sub !== 'string') return false;
+  const iat = typeof payload.iat === 'number' ? payload.iat : 0;
+  const minIat = getMinIssuedAt();
+  if (minIat > 0 && iat < minIat) return true;
+  if (typeof payload.jti === 'string' && revokedJtis.has(payload.jti)) return true;
+  refreshLoggedOutAt();
+  const lo = loggedOutAt.get(sub);
+  if (lo !== undefined && iat < lo) return true;
+  return !!findActiveBan({ discordId: sub });
+}
+
 /** Extract and verify the session JWT from a request's cookie or Authorization header.
  *  Returns the decoded payload on success, null if missing or invalid.
  *  Used by admin endpoints to gate access without re-implementing the JWT logic.
@@ -401,7 +480,7 @@ function revokeJWT(token: string): void {
  *  UOProxy.verifyClient) — Express Request extends IncomingMessage, and we
  *  only read the two header fields both support. v0.3.14 widening: prior
  *  signature locked us out of the upgrade path. */
-export function verifyRequestJwt(req: { headers: Record<string, unknown> }): Record<string, unknown> | null {
+export function verifyRequestJwt(req: { headers: Record<string, unknown> }, opts: { ignoreBan?: boolean } = {}): Record<string, unknown> | null {
   const cookieRaw = req.headers['cookie'];
   const cookieHeader = typeof cookieRaw === 'string' ? cookieRaw : '';
   const cookieToken  = cookieHeader.match(/(?:^|;\s*)__session=([^;]+)/)?.[1] ?? null;
@@ -410,7 +489,7 @@ export function verifyRequestJwt(req: { headers: Record<string, unknown> }): Rec
   const bearerToken  = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
   const token = bearerToken ?? cookieToken;
   if (!token) return null;
-  return verifyJWT(token);
+  return verifyJWT(token, opts);
 }
 
 // ── CSRF: Origin / Referer allow-list ────────────────────────────────────────
@@ -491,6 +570,20 @@ export function currentUser(req: Request): { sub: string; name: string; avatar?:
 // origin (location.hostname); dropping it from the allow-list also stops the
 // proxy from EVER storing it, so a stale/forged value can't persist.
 const ALLOWED_KEYS = new Set(['wsPort', 'wsPath', 'encrypt']);
+// 🚨 VALUE-CHECKED, NOT ONLY KEY-CHECKED (2026-10-29). Dropping wsHost was not enough: the client
+// builds the WS URL by concatenation, `${scheme}://${host}:${wsPort}${wsPath}`, so a saved
+// wsPort of `443@evil.example` produced wss://<host>:443@evil.example/ws — userinfo "<host>:443",
+// HOST evil.example — and the same pagehide auto-save made it permanent. A port is digits; a path
+// starts with "/" (which ends the authority, so nothing after it can name a host). Anything else is
+// refused on write AND filtered on read, so a value stored before this check stops working too.
+const SETTING_VALUE_OK: Record<string, (v: string) => boolean> = {
+  wsPort: (v) => /^\d{1,5}$/.test(v) && Number(v) >= 1 && Number(v) <= 65535,
+  wsPath: (v) => /^\/[A-Za-z0-9._~/%-]{0,127}$/.test(v),
+};
+function settingValueOk(k: string, v: string): boolean {
+  const ok = SETTING_VALUE_OK[k];
+  return !ok || ok(v);
+}
 // Large per-user blobs (JSON strings) the rail UI persists to the Discord
 // account so they travel across browsers/devices: the JS-macro scripts and
 // (later) the agents config. They far exceed the 256-char small-setting cap,
@@ -528,8 +621,40 @@ function settingsPath(userId: string): string {
 async function loadSettings(userId: string): Promise<Record<string, string>> {
   try {
     const raw = await fs.promises.readFile(settingsPath(userId), 'utf8');
-    return JSON.parse(raw) as Record<string, string>;
+    const out = JSON.parse(raw) as Record<string, string>;
+    for (const k of Object.keys(out)) if (typeof out[k] === 'string' && !settingValueOk(k, out[k])) delete out[k];
+    return out;
   } catch { return {}; }
+}
+
+/**
+ * 🚨 GUESTS DO NOT GET THE LARGE KEYS, AND THEIR FILES EXPIRE (audit 2026-10-29, M2). A guest is
+ * free to mint, and each one could PUT three 128 KB keys (~384 KB, up to ~2 MB once JSON-escaped)
+ * into DATA_PATH/guest-<id>.json — the same volume as uonexus.db and cards.db — with nothing ever
+ * deleting them: ~11 MB/hour per IP at the mint cap, unbounded with IPv6 rotation, and a full disk
+ * takes the whole platform down. persistProfile already refuses guests for exactly this reason.
+ * Guests keep their scripts in localStorage (the rail falls back to it); only the small keys are
+ * stored, and sweepGuestSettings removes guest files nobody has written for a week.
+ */
+function isGuestSub(sub: string): boolean {
+  return sub.startsWith('guest-');
+}
+
+const GUEST_SETTINGS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Delete guest settings files untouched for longer than `maxAgeMs`. Returns how many went. */
+export function sweepGuestSettings(maxAgeMs = GUEST_SETTINGS_MAX_AGE_MS, now = Date.now()): number {
+  let removed = 0;
+  let names: string[] = [];
+  try { names = fs.readdirSync(DATA_PATH); } catch { return 0; }
+  for (const name of names) {
+    if (!/^guest-[A-Za-z0-9_-]+\.json$/.test(name)) continue;
+    const file = path.join(DATA_PATH, name);
+    try {
+      if (now - fs.statSync(file).mtimeMs > maxAgeMs) { fs.unlinkSync(file); removed++; }
+    } catch { /* raced with a save or already gone */ }
+  }
+  return removed;
 }
 
 async function persistSettings(userId: string, data: unknown): Promise<void> {
@@ -538,8 +663,8 @@ async function persistSettings(userId: string, data: unknown): Promise<void> {
   for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
     if (typeof v !== 'string') continue;
     if (ALLOWED_KEYS.has(k) && v.length < 256) {
-      clean[k] = v;
-    } else if (LARGE_KEYS.has(k) && v.length <= LARGE_KEY_MAX_BYTES) {
+      if (settingValueOk(k, v)) clean[k] = v;
+    } else if (LARGE_KEYS.has(k) && v.length <= LARGE_KEY_MAX_BYTES && !isGuestSub(userId)) {
       clean[k] = v;
     }
   }
@@ -572,6 +697,10 @@ async function persistSettings(userId: string, data: unknown): Promise<void> {
       existing = JSON.parse(fs.readFileSync(settingsPath(userId), 'utf8')) as Record<string, string>;
     } catch { /* missing or torn: start from nothing, exactly as loadSettings does */ }
     const merged: Record<string, string> = { ...existing, ...clean };
+    // A guest file written before the guest rule existed sheds its large keys on the next save.
+    if (isGuestSub(userId)) for (const k of LARGE_KEYS) delete merged[k];
+    // A value stored before the value check existed is dropped on the next save, not kept forever.
+    for (const k of Object.keys(merged)) if (typeof merged[k] === 'string' && !settingValueOk(k, merged[k])) delete merged[k];
     writeFileAtomic(settingsPath(userId), JSON.stringify(merged, null, 2));
   });
 }
@@ -1091,6 +1220,9 @@ export async function handleDiscordCallback(req: Request, res: Response): Promis
     }
     const avatar = typeof user.avatar === 'string' ? user.avatar : null;
 
+    // A blocked account gets no cookie at all (verifyJWT would refuse it anyway; minting one only
+    // sends the player round a login loop with no explanation).
+    if (findActiveBan({ discordId: userId })) { res.redirect('/?auth=banned'); return; }
     const jwt = issueJWT({ sub: userId, name: username, ...(avatar ? { avatar } : {}) });
     res.appendHeader('Set-Cookie',
       `${COOKIE_NAME}=${jwt}; ${COOKIE_FLAGS};${cookieDomain(req)} Max-Age=${COOKIE_MAX_AGE}; Path=/`
@@ -1178,7 +1310,7 @@ export async function handleGuestLogin(req: Request, res: Response): Promise<voi
 
   // We're about to MINT a brand-new guest sub (no valid cookie). Cap new mints per IP so a client can't
   // rotate fresh guestIds to flood the shared shard with auto-created accounts (audit 2026-06-22 #2).
-  if (!guestMintAllowed(clientIpFromReq(req))) {
+  if (!guestMintAllowed(ipBucketKey(clientIpFromReq(req)))) {
     res.status(429).json({ ok: false, error: 'too many new guest sessions from your network — try again later' });
     return;
   }
@@ -1236,7 +1368,7 @@ export async function handleLogout(req: Request, res: Response): Promise<void> {
       const target = payload.iat + 1;
       if (target > existing) {
         loggedOutAt.set(payload.sub, target);
-        persistLoggedOutAt();
+        persistLoggedOutAt(payload.sub);
       }
     }
     // Add the JWT's jti to the in-memory revocation list as a fast-path
@@ -1341,6 +1473,22 @@ export function adminEraseUser(sub: string): { removed: number; profileBlobs: nu
   // return is now scoped to the DB pass, which is the part that genuinely has nothing to do.
   try { fs.unlinkSync(settingsPath(sub)); } catch { /* absent or unreadable — nothing to erase */ }
 
+  // 🚨 THE SESSION AND THE ADMIN GRANT GO FIRST (audit 2026-10-29, M18). They used to be the last
+  // two steps, after eraseUserData — which THROWS when a store fails (by design, so the reaper
+  // retries). A failed erasure therefore left the deleted user signed in, and an erased admin still
+  // an admin, until a later sweep happened to succeed. Both steps are idempotent, so running them
+  // before the part that can fail costs nothing on a retry.
+  if (!sub.startsWith('guest-')) {
+    try {
+      const admins = getRuntimeConfigFile().admins;
+      if (admins && Object.prototype.hasOwnProperty.call(admins, sub)) {
+        updateRuntimeConfig((cfg) => { if (cfg.admins) delete (cfg.admins as Record<string, unknown>)[sub]; });
+      }
+    } catch { /* best-effort */ }
+    loggedOutAt.set(sub, Math.floor(Date.now() / 1000) + 1);
+    persistLoggedOutAt(sub);
+  }
+
   let removed = 0;
   if (sub.startsWith('guest-')) {
     // eraseUserData skips guests wholesale, and `identities` is one of the tables it would have
@@ -1360,14 +1508,6 @@ export function adminEraseUser(sub: string): { removed: number; profileBlobs: nu
   // Fire-and-forget: erasure must not block on I/O, and both helpers never throw.
   void deleteAllScreenshots(sub).catch(() => { /* best-effort */ });
   void deleteUserLogo(sub).catch(() => { /* best-effort */ });
-  try {
-    const admins = getRuntimeConfigFile().admins;
-    if (admins && Object.prototype.hasOwnProperty.call(admins, sub)) {
-      updateRuntimeConfig((cfg) => { if (cfg.admins) delete (cfg.admins as Record<string, unknown>)[sub]; });
-    }
-  } catch { /* best-effort */ }
-  loggedOutAt.set(sub, Math.floor(Date.now() / 1000) + 1);
-  persistLoggedOutAt();
   return { removed, profileBlobs };
 }
 
@@ -1388,7 +1528,7 @@ export async function handleLogoutAll(req: Request, res: Response): Promise<void
   // companion handleLogout at line ~708 already does `target = iat + 1`
   // for symmetric reason — this aligns logout-all with that contract.
   loggedOutAt.set(user.sub, Math.floor(Date.now() / 1000) + 1);
-  persistLoggedOutAt();
+  persistLoggedOutAt(user.sub);
   // Also revoke this device's JWT and clear its cookie so the caller
   // sees themselves logged out immediately (without waiting for the
   // browser to drop the cookie on next request).

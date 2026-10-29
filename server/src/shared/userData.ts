@@ -125,7 +125,9 @@ export function eraseUserData(sub: string): number {
   // erasure is the last thing that should lose a coin-flip against the other process.
   tx(() => {
     const wnick = (stmt(SQL_NICK_FOR_ERASE)?.get(sub) as { nickname?: string } | undefined)?.nickname; // capture before SINGLE wipes nicknames
-    for (const t of SINGLE_TABLES) removed += ran(`DELETE FROM ${t} WHERE sub = ?`, sub);
+    // account_deletions is the reaper's RETRY record, so it goes last — after every registered
+    // store below has succeeded (see the end of this function).
+    for (const t of SINGLE_TABLES) if (t !== 'account_deletions') removed += ran(`DELETE FROM ${t} WHERE sub = ?`, sub);
     removed += ran(SQL_REPORTER, sub);
     removed += ran(SQL_DEL_MY_LISTINGS, sub);
     removed += ran(SQL_ANON_BUYER, sub);
@@ -168,5 +170,11 @@ export function eraseUserData(sub: string): number {
       }
     }
   }
+  // 🚨 THE SCHEDULE ROW GOES LAST (audit 2026-10-29, M18). It used to be deleted inside the main
+  // transaction above, so when a store below then failed and threw, the reaper's "leave the
+  // schedule for the next sweep to retry" found no schedule: nothing ever retried, and the cards,
+  // escrow rows (which RESURRECT ownership at boot), profile files and admin grant survived a
+  // deletion everyone had been told was done. Deleted here, it only goes once everything did.
+  removed += ran('DELETE FROM account_deletions WHERE sub = ?', sub);
   return removed;
 }

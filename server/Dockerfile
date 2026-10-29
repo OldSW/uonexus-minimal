@@ -33,7 +33,7 @@ COPY scripts/check-build-tag.mjs scripts/check-src-syntax.mjs ./scripts/
 # The minimal stack runs its asset worker from this same image, as a second service with a different
 # command. It needs the worker AND the renderer it imports — shipping one without the other produces
 # an image that builds clean and crash-loops on start with a module-not-found.
-COPY scripts/minimal-asset-worker.mjs scripts/bake-worldmap.mjs ./scripts/
+COPY scripts/minimal-asset-worker.mjs scripts/bake-worldmap.mjs scripts/_hashFile.mjs ./scripts/
 
 # 🚨 THE GATE HAS TO LIVE WHERE THE DEPLOY ACTUALLY GOES THROUGH. src/ is transformed by esbuild
 # at CONTAINER START, not at build time, so a syntax error in it produces a healthy-looking image

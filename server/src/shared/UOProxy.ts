@@ -10,10 +10,11 @@ import { ASSETS_HTTP_PORT, getPublicOrigins, TRUST_PROXY_HOPS } from './config.j
 import { Huffman } from './Huffman.js';
 import { DeathWatch } from './deathWatch.js';
 import { recordDeathWitness } from './deathWitness.js';
+import { ipBucketKey } from './clientIp.js';
 import { getServer, defaultSlug, SLUG_REGEX, type ServerRecord } from './serverRegistry.js';
 import { miniAccountForDiscord, miniAccountForGuest, miniAccountForSpectator } from './miniAccount.js';
 import { resolvePublicIp } from './netGuard.js';
-import { verifyRequestJwt } from './auth.js';
+import { verifyRequestJwt, isSessionRevoked } from './auth.js';
 import { allowUpgrade } from './rateLimiter.js';
 import { findActiveBan, banMatches, type BanEntry } from './banRegistry.js';
 import { sweepBannedSessions } from './banSweep.js';
@@ -189,7 +190,7 @@ function resolveMinigameFromReq(req: http.IncomingMessage): string | null {
 // If the log on the NAS shows an older tag, the docker image cache lied.
 // Force a clean rebuild with:
 //   docker compose build proxy --no-cache && docker compose up -d --force-recreate proxy
-export const PROXY_BUILD_TAG = '2026-10-27T-v1.0.62-catchup (a month of Survival Arena work held in dev reaches production with the minigames shard WebSocket gate, and a self-hosted install from a current UO installer gets its art, maps, sound and houses instead of a black screen.)';
+export const PROXY_BUILD_TAG = '2026-10-29T-v1.0.63-audit (the 41-PR security audit of the proxy, the gamefiles path and the minimal stack reaches production)';
 
 // When ModernUO finishes the auth phase it sends 0x8C and immediately FINs
 // the TCP. The proxy used to react by closing the WS with code 1000 right
@@ -227,7 +228,12 @@ const PACKET_0x8C_LEN = 11;
 const WS_MAX_PAYLOAD_BYTES = 64 * 1024;      // single WS frame
 const WS_HANDSHAKE_TIMEOUT_MS = 5_000;       // pre-upgrade slow-loris cap
 const TCP_IDLE_TIMEOUT_MS = 15 * 60 * 1000;  // 15 min idle TCP→destroy
-const TCP_BUF_MAX_BYTES = 64 * 1024;         // accumulation buffer cap
+// Accumulation buffer cap. It is emptied after every read is forwarded, so in practice it bounds
+// ONE read after Huffman decoding — and that is up to 4x the 64 KiB a socket read delivers (2-bit
+// shortest code). At 64 KiB it dropped ordinary players on dense bursts, exactly like the decoder's
+// own ceiling did (audit 2026-10-29, M5). A stalled BROWSER is handled separately, by the
+// ws.bufferedAmount pause/kill below, so this does not need to be small to protect memory.
+const TCP_BUF_MAX_BYTES = 4 * 64 * 1024 + 1024;
 const WS_BUFFERED_PAUSE_BYTES = 1 * 1024 * 1024;  // pause TCP read above this
 const WS_BUFFERED_KILL_BYTES = 8 * 1024 * 1024;   // destroy session above this
 const SCAN_0x8C_MAX_BYTES = 1024;            // walk only first 1 KiB for 0x8C
@@ -257,6 +263,19 @@ const WS_C2S_REFILL_PER_SEC = 200;
 // adds up to absurd volume. ModernUO's busiest legitimate session over a
 // few hours is single-digit MB; 256 MB lifetime is generous.
 const WS_C2S_LIFETIME_BYTES = 256 * 1024 * 1024;
+
+// 🚨 UPSTREAM WRITE CEILING (audit 2026-10-29, A3). The s2c direction has always paused the shard
+// socket when the browser falls behind (ws.bufferedAmount), but c2s had nothing: every frame went
+// to tcpSocket.write() without looking at what was already queued, and a socket that is still
+// CONNECTING is writable too. Against a shard that stops reading — or whose connect just hangs —
+// a client sending 64 KiB frames under the rate limit grew the game process by ~40 MB/s; three
+// sessions from one IP took it from 100 MB to 815 MB in 20 s, past the container's 768m limit, and
+// every player on every shard went down with it. A UO client's real upstream traffic is a few KB,
+// so 1 MiB of unsent bytes means the shard is not reading: close this session, not the process.
+const TCP_WRITE_BUFFER_MAX = 1024 * 1024;
+// And a connect that never completes is ended here, not by the 15-minute idle timer. Read from the
+// environment for the same reason as UO_MAX_SESSIONS: so a test can reach it.
+const TCP_CONNECT_TIMEOUT_MS = Math.max(100, Number(process.env.UO_CONNECT_TIMEOUT_MS) || 15_000);
 
 // Cumulative Huffman output cap per session (audit WS-H1). Per-call cap
 // (`maxOut=65536`) only protects one decompress call; without a lifetime
@@ -569,7 +588,13 @@ export const splitGameLoginBatched = splitBatchedHandshake;
 
 // ── Session ───────────────────────────────────────────────────────────────────
 
+/** How long a close() with a reason may take to reach the browser before the socket is cut. */
+const WS_CLOSE_GRACE_MS = 2000;
+
 class Session {
+  /** The verified JWT payload this session was opened with (null for none) — re-checked for
+   *  revocation by the live-session sweep (audit 2026-10-29, L2). */
+  jwtPayload: Record<string, unknown> | null = null;
   // Mutable so the Pattern B retry path can swap the underlying socket
   // when ModernUO's ThreadStatic+async race fires a silent FIN.
   private tcpSocket: net.Socket;
@@ -580,6 +605,8 @@ class Session {
   private bytesScanned = 0;
   private tcpPaused = false;
   private destroyed = false;
+  private upstreamConnected = false;
+  private connectTimer: NodeJS.Timeout | null = null;
   private readonly proxyAddress: { ipv4: number[]; port: number };
   private readonly onClosed: () => void;
   // WS L-3 fix: `onClosed` decrements the per-IP counter and must run
@@ -814,6 +841,16 @@ class Session {
     // a WeakMap keyed on socket — every fresh socket from makeTcpSocket()
     // re-registers on retry.
     registerUpstreamConnect(this.tcpSocket, this.target.slug);
+    // Armed for EVERY connect, retries included (each one builds a fresh socket).
+    this.upstreamConnected = false;
+    if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      if (this.upstreamConnected || this.destroyed) return;
+      console.warn(`[UOProxy] [${this.remoteAddr}] upstream connect to ${this.target.slug} not done in ${TCP_CONNECT_TIMEOUT_MS}ms — closing`);
+      if (!this.wsClosed && this.ws.readyState === WebSocket.OPEN) this.ws.close(1013, 'upstream connect timeout');
+      this.destroy();
+    }, TCP_CONNECT_TIMEOUT_MS);
     // v0.8.43 SSRF: an untrusted shard host is resolved + PINNED to a verified
     // PUBLIC IP, so a DNS rebind can't redirect the bridge into our LAN /
     // cloud-metadata. Applies to self-service shards AND non-self-service shards
@@ -836,6 +873,8 @@ class Session {
    *  Extracted from connectTcp so both the direct and the self-service
    *  (resolve+pin) connect paths share identical post-connect behaviour. */
   private onUpstreamConnected(): void {
+      this.upstreamConnected = true;
+      if (this.connectTimer !== null) { clearTimeout(this.connectTimer); this.connectTimer = null; }
       this.t0 = Date.now();
       console.log(
         `[UOProxy] [${this.remoteAddr}] TCP connected → ${this.target.slug} (${this.target.host}:${this.target.port}) (t0)`
@@ -870,6 +909,13 @@ class Session {
         // gap gets coalesced → ModernUO peek rejects the 69B batch). maybeSendWebIdentity
         // is a no-op on the mini game-phase (0xA4 suppressed).
         const _miniGamePhaseRetry = this.identity.miniAutologin && this.skip8CScan;
+        // 🚨 COUNT THE REPLAY (audit 2026-10-29, A6). The first attempt records its c2s bytes before
+        // writing, so a shard that FINs right after reading them is an application close, not a
+        // block. The replay wrote the same bytes without recording them, so its fast FIN looked
+        // like "closed before the client said anything" and put the WHOLE slug into a 5-minute
+        // cool-down. One anonymous session sending a bogus 69-byte 0x91 bundle did that, renewably,
+        // for every web player of that shard.
+        recordC2sBytes(this.tcpSocket, buf.length);
         if (parts.length > 1) {
           this.tcpSocket.write(parts[0]);
           const _emitSecond = () => {
@@ -1115,7 +1161,14 @@ class Session {
       let inbound: Buffer = chunk;
       if (this.compressionEnabled) {
         try {
-          inbound = this.huffman.decompress(chunk);
+          // 🚨 SIZED TO THE INPUT (audit 2026-10-29, M5). The default per-call ceiling is 64 KiB of
+          // OUTPUT, but one socket read can carry 64 KiB of INPUT, and UO Huffman expands: the
+          // shortest code is 2 bits (0x00), so a byte decodes to at most 4, plus at most 3 symbols
+          // still pending from the previous read. A dense-area burst, a read after a backpressure
+          // pause, or an event-loop stall therefore threw here and DROPPED an ordinary player
+          // (reproduced: an 84 KB burst closed the session). 4·len + 8 can never be exceeded by a
+          // valid stream; the lifetime cap below still bounds the total.
+          inbound = this.huffman.decompress(chunk, Math.max(65536, chunk.length * 4 + 8));
         } catch (err) {
           console.error(
             `[UOProxy] [${this.remoteAddr}] Huffman decompress error: ${(err as Error).message}`
@@ -1463,6 +1516,9 @@ class Session {
      // (index.ts). In a single-process proxy ONE synchronous throw here would
      // drop EVERY player, so contain any unexpected throw to THIS session.
      try {
+      // Nothing more is forwarded once the session is being torn down (frames can still arrive
+      // while a close() handshake finishes — see destroy()).
+      if (this.destroyed) return;
       if (!isBinary) {
         // R2-M-9: text frames are not part of the UO protocol; close hard
         // instead of looping on them.
@@ -1489,6 +1545,17 @@ class Session {
           `[UOProxy] [${this.remoteAddr}] c2s rate/byte cap exceeded (lifetime=${this.c2sLifetimeBytes}B) — closing`
         );
         this.ws.close(1008, 'rate limit');
+        this.destroy();
+        return;
+      }
+
+      // Upstream write ceiling (A3, see TCP_WRITE_BUFFER_MAX). Checked before anything is queued,
+      // so what this session holds in memory stays bounded by the ceiling plus one frame.
+      if (this.tcpSocket.writableLength + buf.length > TCP_WRITE_BUFFER_MAX) {
+        console.warn(
+          `[UOProxy] [${this.remoteAddr}] ${this.tcpSocket.writableLength}B already queued to ${this.target.slug} — upstream not reading, closing`
+        );
+        this.ws.close(1013, 'upstream not reading');
         this.destroy();
         return;
       }
@@ -1777,6 +1844,10 @@ class Session {
       clearTimeout(this.firstC2sDeadlineTimer);
       this.firstC2sDeadlineTimer = null;
     }
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
     // WS L-2 fix: clear the maybeCleanup() force-close timer too. If a
     // session is destroy()-ed while that 10s timer is armed, it would
     // otherwise fire later and run the cleanup path again → onClosed()
@@ -1786,7 +1857,18 @@ class Session {
       this.cleanupTimeout = null;
     }
     if (!this.wsClosed && this.ws.readyState !== WebSocket.CLOSED) {
-      try { this.ws.terminate(); } catch { /* already gone */ }
+      // 🚨 A close() IN FLIGHT GETS TO FINISH (found by the 2026-10-29 Windows test pass). Every
+      // "close with a reason" path here is `ws.close(code, reason)` then destroy(), and an
+      // immediate terminate() could drop the close frame before it was written: the client saw
+      // 1006 with no reason instead of 1013 'upstream not reading', 1008 'rate limit', … — on
+      // Linux it usually got out first, on Windows it did not. The upstream socket still goes NOW
+      // (that is what bounds memory); the browser gets a short grace to receive the reason.
+      if (this.ws.readyState === WebSocket.CLOSING) {
+        const ws = this.ws;
+        setTimeout(() => { try { ws.terminate(); } catch { /* already gone */ } }, WS_CLOSE_GRACE_MS).unref?.();
+      } else {
+        try { this.ws.terminate(); } catch { /* already gone */ }
+      }
     }
     if (!this.tcpClosed) {
       try { this.tcpSocket.destroy(); } catch { /* already gone */ }
@@ -1944,7 +2026,9 @@ export class UOProxy {
         // v0.3.14: extract auth handle from the WS upgrade JWT once so
         // the rate limit, ban check, and guestsAllowed gate share one
         // verify call (HMAC + iat + revoked-jti + exp checks happen here).
-        const jwt = verifyRequestJwt(info.req);
+        // ignoreBan: read a banned account's token AS that account, so the ban below refuses it
+        // (403) instead of the cookie reading as absent and the player entering as a guest.
+        const jwt = verifyRequestJwt(info.req, { ignoreBan: true });
         const discordSub = (jwt && isSnowflake(jwt.sub)) ? jwt.sub : null;
 
         // v0.3.14: persistent admin ban-list. discordId match wins over
@@ -1967,7 +2051,7 @@ export class UOProxy {
         // stable handle they have).
         const rlKey = discordSub
           ? { kind: 'discord' as const, id: discordSub }
-          : { kind: 'ip' as const, id: ip };
+          : { kind: 'ip' as const, id: ipBucketKey(ip) };   // an IPv6 /64 is one subscriber (M3)
         if (!allowUpgrade(rlKey.kind, rlKey.id, ip)) {
           console.warn(
             `[UOProxy] reject upgrade — rate limit (${rlKey.kind}=${rlKey.id}) burst exhausted`
@@ -1998,7 +2082,7 @@ export class UOProxy {
         // but not yet promoted to a full Session; the global cap counts
         // both live sessions and pending reservations so it is atomic too.
         // Mirrors the v0.3.24 ban-recheck shape (check + commit together).
-        const ipCount = this.perIp.get(ip) ?? 0;
+        const ipCount = this.perIp.get(ipBucketKey(ip)) ?? 0;
         if (ipCount >= PER_IP_SESSION_CAP) {
           console.warn(`[UOProxy] reject upgrade from ${ip} — per-IP cap (${PER_IP_SESSION_CAP}) reached`);
           cb(false, 429, 'too many sessions');
@@ -2014,7 +2098,7 @@ export class UOProxy {
         // handleConnection (which does NOT re-increment), or released by
         // releaseReservation() if the upgrade is aborted/rejected after
         // this point but before a full Session exists.
-        this.perIp.set(ip, ipCount + 1);
+        this.perIp.set(ipBucketKey(ip), ipCount + 1);
         this.reservedConnections++;
         // Safety net for the abort window between cb(true) and the
         // 'connection' event: if the underlying socket dies during the
@@ -2083,9 +2167,10 @@ export class UOProxy {
    */
   private releaseReservation(ip: string): void {
     this.reservedConnections = Math.max(0, this.reservedConnections - 1);
-    const cnt = (this.perIp.get(ip) ?? 1) - 1;
-    if (cnt <= 0) this.perIp.delete(ip);
-    else this.perIp.set(ip, cnt);
+    const key = ipBucketKey(ip);
+    const cnt = (this.perIp.get(key) ?? 1) - 1;
+    if (cnt <= 0) this.perIp.delete(key);
+    else this.perIp.set(key, cnt);
   }
 
   private handleConnection(ws: WebSocket, req: http.IncomingMessage): void {
@@ -2138,7 +2223,7 @@ export class UOProxy {
     // v0.3.14: re-verify the JWT here so the Session can carry the
     // Discord sub for the admin force-close-on-ban path. Cheap (HMAC over
     // ~200 bytes) and we already paid the verify cost in verifyClient.
-    const jwt = verifyRequestJwt(req);
+    const jwt = verifyRequestJwt(req, { ignoreBan: true });   // see verifyClient: the ban is checked just below
     const discordSub = (jwt && isSnowflake(jwt.sub)) ? jwt.sub : null;
     const discordName = (jwt && typeof jwt.name === 'string') ? jwt.name : '';
 
@@ -2289,9 +2374,10 @@ export class UOProxy {
       () => {
         this.sessions.delete(session);
         untrackSession(session);
-        const cnt = (this.perIp.get(remoteAddr) ?? 1) - 1;
-        if (cnt <= 0) this.perIp.delete(remoteAddr);
-        else this.perIp.set(remoteAddr, cnt);
+        const ipKey = ipBucketKey(remoteAddr);
+        const cnt = (this.perIp.get(ipKey) ?? 1) - 1;
+        if (cnt <= 0) this.perIp.delete(ipKey);
+        else this.perIp.set(ipKey, cnt);
         console.log(`[UOProxy] Session removed (${this.sessions.size} active)`);
       },
       discordSub,
@@ -2301,6 +2387,7 @@ export class UOProxy {
         ...(miniAccount && { miniAccount }),
         ...(miniSub && { miniSub }),
         ...(miniAuto && { miniAutologin: true }) });
+    session.jwtPayload = jwt;
     this.sessions.add(session);
     // proxyStats: live "online now" snapshot for the supreme-admin metrics panel.
     // destroy closure powers the admin "kick" button (sessions panel) without
@@ -2342,6 +2429,15 @@ export class UOProxy {
         `[UOProxy] [${s.remoteAddr}] force-close: live session matches ban id=${ban.id} `
         + `${ban.discordId ? `discordId=${ban.discordId}` : `ipCidr=${ban.ipCidr}`}`);
     });
+
+    // And against REVOCATION: a session opened with a token that has since been logged out
+    // (single or everywhere), rotated away or erased ends here, within one sweep (L2).
+    for (const session of Array.from(this.sessions)) {
+      if (session.jwtPayload && isSessionRevoked(session.jwtPayload)) {
+        console.warn(`[UOProxy] [${session.remoteAddr}] force-close: the session's token was revoked`);
+        try { session.destroy(); } catch { /* already gone */ }
+      }
+    }
   }
 
   /**
