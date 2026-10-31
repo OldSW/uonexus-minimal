@@ -262,6 +262,7 @@ echo "[build] Copying output to client/..."
 mirror_into() {  # mirror_into SRC DST  ==  rsync -a --delete, keeping gamefiles/ *.br *.gz in DST
   local src="$1" dst="$2"
   if command -v rsync &>/dev/null; then
+    mkdir -p "$dst"  # rsync creates only the last path component; a fresh clone has no client/
     rsync -a --delete --exclude='gamefiles/' --exclude='*.br' --exclude='*.gz' "$src/" "$dst/"
     return
   fi
