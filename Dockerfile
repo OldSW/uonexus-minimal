@@ -57,7 +57,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 COPY --from=source /src/server/tsconfig.json ./
 COPY --from=source /src/server/src/ ./src/
 COPY --from=source /src/server/scripts/check-build-tag.mjs /src/server/scripts/check-src-syntax.mjs \
-     /src/server/scripts/minimal-asset-worker.mjs /src/server/scripts/bake-worldmap.mjs ./scripts/
+     /src/server/scripts/minimal-asset-worker.mjs /src/server/scripts/bake-worldmap.mjs /src/server/scripts/_hashFile.mjs ./scripts/
 RUN node scripts/check-build-tag.mjs src/shared/UOProxy.ts \
     && node scripts/check-src-syntax.mjs
 
