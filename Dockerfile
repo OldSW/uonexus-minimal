@@ -3,6 +3,7 @@
 # Everything is built from one checkout of the fork (UONEXUS_REPO @ UONEXUS_REF), no release
 # zip involved. Targets:
 #   client - the client bundle only (copied into a shared volume on start)
+#   client-tuo - the TazUO bundle, served at /tuo/
 #   proxy  - Node WebSocket relay (UO protocol <-> browser)
 #   nginx  - plain nginx with upstream's config; serves the bundle from a mounted volume
 #
@@ -44,6 +45,28 @@ RUN CLIENT_NAME=cuo bash ./server/scripts/build.sh prod \
 # --- client image: just the bundle -----------------------------------------------
 FROM busybox:stable AS client
 COPY --from=client-build /repo/client/minimal /client
+CMD ["sh", "-c", "cp -a /client/. /out/"]
+
+# --- TazUO bundle (served at /tuo/) --------------------------------------------------------
+# A second, separate compile: the two bundles differ only in the assembly, so this repeats the
+# client-build steps with CLIENT_NAME=tuo and lands in client/minimal-tuo.
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS client-tuo-build
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 libatomic1 rsync git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+RUN dotnet workload install wasm-tools
+WORKDIR /repo
+COPY --from=source /src/ ./
+ARG UONEXUS_REF
+ENV WEBCLIENT_VERSION=${UONEXUS_REF}
+RUN CLIENT_NAME=tuo bash ./server/scripts/build.sh prod \
+    && node server/scripts/build-minimal-bundle.mjs tuo \
+    && test -d client/minimal-tuo/_framework
+
+FROM busybox:stable AS client-tuo
+COPY --from=client-tuo-build /repo/client/minimal-tuo /client
 CMD ["sh", "-c", "cp -a /client/. /out/"]
 
 # --- proxy -------------------------------------------------------------------

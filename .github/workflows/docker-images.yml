@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [client, proxy, nginx]
+        target: [client, client-tuo, proxy, nginx]
     steps:
       - uses: actions/checkout@v4
 

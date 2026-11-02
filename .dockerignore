@@ -1,0 +1,5 @@
+# The root Dockerfile clones its source from git and only COPYs ./certs from this context,
+# so send nothing else to the daemon.
+*
+!certs/
+!Dockerfile
