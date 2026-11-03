@@ -985,7 +985,12 @@ export function toPublic(s: ServerRecord, status: string, daysUntilDeletion?: nu
 /** Returns active servers + pending-deletion servers — all visible in the picker. */
 export function listServers(): PublicServer[] {
   if (!isLoaded) throw new Error('ServerRegistry.listServers called before loadRegistry');
-  const active = Array.from(registry.values()).map((s) => toPublic(s, 'active'));
+  // Sorted by id: the registry is filled in readdir order, which is filesystem-dependent (and puts
+  // `schattenwelt-test.yaml` before `schattenwelt.yaml`, since '-' < '.'), so clients listing these
+  // would otherwise show the test shard first.
+  const active = Array.from(registry.values())
+    .sort((a, b) => a.id - b.id)
+    .map((s) => toPublic(s, 'active'));
   const deletionQueue = getDeletionQueue();
   const pending = deletionQueue.map((e) => toPublic(e.record, 'pending_deletion', daysRemaining(e)));
   return [...active, ...pending];

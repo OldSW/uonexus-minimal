@@ -2202,6 +2202,59 @@ function _consumeClientHandoff() {
   } catch (e) { return false; }
 }
 
+/**
+ * Server toggle on both landing panels, styled like the client switch (same .client-choice-* rules).
+ * minimal-boot.js has already resolved the active shard and published the list; this only paints it
+ * and records changes. Not rendered unless 2+ shards exist. window.__MINIMAL_SERVER is read once,
+ * AFTER the gate, so a change here is picked up on Play with no reload.
+ *
+ * The row's own class is `server-choice`, NOT `client-choice`: _wireClientSwitch skips a panel that
+ * already contains a `.client-choice`, so reusing that class would suppress the client switch.
+ */
+function _wireServerSelect() {
+  const list = window.__MINIMAL_SERVERS;
+  if (!Array.isArray(list) || list.length < 2) return;
+  const rows = [];
+  const paint = () => {
+    const cur = window.__MINIMAL_SERVER && window.__MINIMAL_SERVER.slug;
+    for (const row of rows) {
+      for (const b of row.querySelectorAll('.client-choice-opt')) {
+        const on = b.getAttribute('data-server') === cur;
+        b.classList.toggle('is-current', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+  };
+  for (const panelId of ['sso-panel', 'sso-user']) {
+    const panel = document.getElementById(panelId);
+    if (!panel || panel.querySelector('.server-choice')) continue;
+    const row = document.createElement('div');
+    row.className = 'server-choice';   // NOT client-choice; see note above
+    const lab = document.createElement('span');
+    lab.className = 'client-choice-label';
+    lab.textContent = 'Server';
+    row.appendChild(lab);
+    const opts = document.createElement('div');
+    opts.className = 'client-choice-opts';
+    for (const s of list) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'client-choice-opt';
+      b.textContent = s.displayName || s.slug;   // textContent: never innerHTML
+      b.setAttribute('data-server', s.slug);
+      b.addEventListener('click', () => {
+        if (window.__minimalSetServer && window.__minimalSetServer(s.slug)) paint();
+      });
+      opts.appendChild(b);
+    }
+    row.appendChild(opts);
+    rows.push(row);
+    const firstAction = panel.querySelector('.discord-btn, #play-game');
+    if (firstAction) panel.insertBefore(row, firstAction); else panel.appendChild(row);
+  }
+  paint();
+}
+
 async function discordInit() {
   // Both landing panels (#sso-panel for a visitor, #sso-user for a returning player) carry the
   // invite icon, so this runs before the branch rather than inside one of them. Not awaited: a
@@ -2209,6 +2262,7 @@ async function discordInit() {
   void _wireDiscordInvite();
   _wireFaqLauncher();
   void _wireClientSwitch();
+  _wireServerSelect();
 
   // Arrived here because the player already pressed Play on the other bundle. Showing the gate again
   // would make switching client cost two clicks on two screens, which is the thing being fixed.

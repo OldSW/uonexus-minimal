@@ -215,12 +215,24 @@ export function buildMinimalApp(): Express {
   // ── scripting policy ───────────────────────────────────────────────────────
   // Which macro verbs this shard allows. Editable, because the registry has real setters and the
   // decision is the operator's -- a read-only view would just be a list they cannot act on.
+  // Which shard an admin route means. With one registered shard that is still implicit
+  // (defaultSlug()); with several there is no default, so the caller names one with `?slug=` or a
+  // body `slug`. A named slug that is not registered is an error, never a silent fallback to
+  // another shard: the panel would otherwise show or edit a shard the operator did not pick.
+  const adminSlug = (raw: unknown): { slug: string | null; bad?: true } => {
+    const want = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+    if (!want) return { slug: defaultSlug() };
+    return getServer(want) ? { slug: want } : { slug: null, bad: true };
+  };
+
   app.get('/api/admin/script-policy', async (req, res) => {
     if (!(await isAdminRequest(req))) { json(res, 403, { error: 'forbidden' }); return; }
     // defaultSlug() is null on an install whose YAML was rejected — the same state the boot log
     // reports as `shard=default`. Answer honestly rather than crashing the panel: there is no shard
     // to hold a policy for yet.
-    const slug = defaultSlug();
+    const sel = adminSlug(req.query.slug);
+    if (sel.bad) { json(res, 404, { error: 'unknown shard' }); return; }
+    const slug = sel.slug;
     json(res, 200, {
       // The catalog travels with the policy, because a blocklist of bare verb names is not
       // something an operator can act on: they would have to already know every name to type one.
@@ -235,8 +247,10 @@ export function buildMinimalApp(): Express {
 
   app.put('/api/admin/script-policy', safeOrigin, async (req, res) => {
     if (!(await isAdminRequest(req))) { json(res, 403, { error: 'forbidden' }); return; }
-    const body = (req.body || {}) as { globalBlock?: unknown; shardBlock?: unknown };
-    const slug = defaultSlug();
+    const body = (req.body || {}) as { globalBlock?: unknown; shardBlock?: unknown; slug?: unknown };
+    const sel = adminSlug(body.slug ?? req.query.slug);
+    if (sel.bad) { json(res, 404, { error: 'unknown shard' }); return; }
+    const slug = sel.slug;
     // 'key' in body, never a rebuilt object: the panel sends one list at a time, and rebuilding
     // from the body would silently reset whichever list the caller did not include.
     if ('globalBlock' in body) setGlobalBlock(body.globalBlock);
@@ -322,13 +336,17 @@ export function buildMinimalApp(): Express {
   // would put host, port and secrets somewhere they do not need to be.
   app.get('/api/admin/backup', async (req, res) => {
     if (!(await isAdminRequest(req))) { json(res, 403, { error: 'forbidden' }); return; }
+    // Every registered shard, so a multi-shard backup loses nothing; `shardBlock` stays as the
+    // single-shard shape older exports (and anything reading them) expect.
     const slug = defaultSlug();
+    const shardBlocks: Record<string, string[]> = {};
+    for (const sv of listServers()) shardBlocks[sv.slug] = getShardBlock(sv.slug);
     res.setHeader('Cache-Control', 'no-store');
     json(res, 200, {
       version: 1,
       exportedAt: new Date().toISOString(),
       settings: readSettings(),
-      scriptPolicy: { globalBlock: getGlobalBlock(), shardBlock: slug ? getShardBlock(slug) : [] },
+      scriptPolicy: { globalBlock: getGlobalBlock(), shardBlock: slug ? getShardBlock(slug) : [], shardBlocks },
       bans: listBans(),
     });
   });

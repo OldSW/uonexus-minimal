@@ -322,6 +322,8 @@
       this install; the client is told the effective list at boot, so a change takes hold on the
       next load. Everything is allowed by default — this is a list of what you turn OFF, not
       what you turn on.</p>
+    <label id="pol-shard-row" class="sub" style="display:none">Shard
+      <select id="pol-shard"></select></label>
     <dl id="pol"><dd class="sub">loading…</dd></dl>
     <div id="pol-grid" class="verbgrid"></div>
     <div class="row-actions">
@@ -901,8 +903,34 @@
         if (cbs[i].parentNode) cbs[i].parentNode.className = on ? '' : 'off';
       }
     }
+    // With 2+ registered shards the server has no default one, so the panel names the shard it is
+    // showing. One shard (or /api/servers unreachable): no selector and no slug sent, as before.
+    var polSlug = '';
+    function polQuery() { return polSlug ? '?slug=' + encodeURIComponent(polSlug) : ''; }
+    function polShards() {
+      var sel = document.getElementById('pol-shard');
+      var row = document.getElementById('pol-shard-row');
+      if (!sel || !row || sel.options.length) return Promise.resolve();
+      return fetch('/api/servers', { cache: 'no-store', credentials: 'same-origin' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          var list = ((d && d.servers) || []).filter(function (x) { return !x.status || x.status === 'active'; });
+          if (list.length < 2) return;
+          list.forEach(function (x) {
+            var o = document.createElement('option');
+            o.value = x.slug; o.textContent = x.displayName || x.slug;
+            sel.appendChild(o);
+          });
+          polSlug = sel.value;
+          row.style.display = '';
+          sel.addEventListener('change', function () { polSlug = sel.value; loadPolicy(); });
+        })
+        .catch(function () { /* no selector; single-shard behaviour */ });
+    }
     function loadPolicy() {
-      fetch('/api/admin/script-policy', { cache: 'no-store', credentials: 'same-origin' })
+      polShards().then(function () {
+        return fetch('/api/admin/script-policy' + polQuery(), { cache: 'no-store', credentials: 'same-origin' });
+      })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (d) { if (d) renderPolicy(d); })
         .catch(function () { rows(document.getElementById('pol'), [['Policy', 'could not be read', 'bad']]); });
@@ -925,7 +953,7 @@
       fetch('/api/admin/script-policy', {
         method: 'PUT', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ globalBlock: list })
+        body: JSON.stringify(polSlug ? { globalBlock: list, slug: polSlug } : { globalBlock: list })
       }).then(function (r) { return r.ok ? r.json() : null; })
         .then(function (d) {
           ps.disabled = false;

@@ -257,9 +257,13 @@ namespace ZLibNative
             uint crcAdler = _Adler32.GetValue();
             uint crcStream = BitConverter.ToUInt32(_CRC, 0);
 
+            // Some servers (e.g. the Schattenwelt RunUO) SYNC-flush their 0xDD gumps and append no
+            // Adler32 at all, so the last 4 bytes here are deflate data and can never match. The
+            // deflate stream has already decoded cleanly by this point, and the callers read a known
+            // length, so a mismatch is tolerated instead of aborting the packet.
             if (crcStream != crcAdler)
             {
-                throw new Exception("CRC mismatch");
+                return;
             }
         }
 

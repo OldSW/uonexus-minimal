@@ -5620,6 +5620,13 @@ namespace ClassicUO.Network
 
                 layout = Encoding.UTF8.GetString(decData.AsSpan(0, dlen));
             }
+            catch (Exception ex)
+            {
+                // Without this a throw here escaped the packet handler and stalled the game loop.
+                Log.Error($"Failed to decompress or decode gump layout: {ex.Message}");
+
+                return;
+            }
             finally
             {
                 System.Buffers.ArrayPool<byte>.Shared.Return(decData);
@@ -5689,6 +5696,12 @@ namespace ClassicUO.Network
 
                         //    index += length;
                         //}
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"Failed to decompress or decode gump lines: {ex.Message}");
+
+                        return;
                     }
                     finally
                     {
