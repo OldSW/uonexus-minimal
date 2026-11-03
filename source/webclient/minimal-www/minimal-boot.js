@@ -52,6 +52,62 @@
   }
   if (!server.displayName) server.displayName = server.slug;
 
+  // ── server selection ─────────────────────────────────────────────────────
+  // config.json still names the DEFAULT shard (and is the whole story on a single-shard install or
+  // when the relay is unreachable). When the relay registry holds two or more active shards, the
+  // landing offers a dropdown; the pick is stored in localStorage and applied here, before main.js
+  // reads window.__MINIMAL_SERVER. Same synchronous-read rationale as config.json above.
+  //
+  // Only the fields of the DEFAULTS contract are taken from a registry record, so an unexpected or
+  // misspelled field can never reach the loader. `?server=<slug>` overrides the stored pick for a
+  // single visit (handy for links); an unknown slug is ignored rather than trusted.
+  var SERVER_PICK_KEY = 'uominimal.server';
+  function toServer(rec) {
+    var s = {};
+    for (var k in DEFAULTS) if (Object.prototype.hasOwnProperty.call(DEFAULTS, k)) {
+      var v = rec && typeof rec[k] === 'string' && rec[k].trim() ? rec[k].trim() : server[k];
+      s[k] = v;
+    }
+    if (rec && typeof rec.slug === 'string') s.slug = rec.slug.trim().toLowerCase();
+    if (!rec || !rec.displayName) s.displayName = s.slug;
+    return s;
+  }
+  var servers = [];
+  try {
+    var sx = new XMLHttpRequest();
+    sx.open('GET', '/api/servers', false);
+    sx.send(null);
+    if (sx.status >= 200 && sx.status < 300) {
+      var list = JSON.parse(sx.responseText).servers;
+      if (Array.isArray(list)) {
+        servers = list.filter(function (r) {
+          return r && typeof r.slug === 'string' && r.slug && !r.pending && !r.hidden
+            && (!r.status || r.status === 'active');
+        }).map(toServer);
+      }
+    }
+  } catch (e) { /* relay down or not JSON: stay on config.json's shard */ }
+
+  window.__MINIMAL_SERVERS = servers.length >= 2 ? servers : [];
+  if (window.__MINIMAL_SERVERS.length) {
+    var want = null;
+    try { want = (new URLSearchParams(location.search).get('server') || '').trim().toLowerCase(); } catch (e) {}
+    if (!want) { try { want = localStorage.getItem(SERVER_PICK_KEY) || ''; } catch (e) { want = ''; } }
+    var match = null;
+    for (var i = 0; i < servers.length; i++) if (servers[i].slug === want) match = servers[i];
+    if (!match) for (var j = 0; j < servers.length; j++) if (servers[j].slug === server.slug.toLowerCase()) match = servers[j];
+    server = match || servers[0];
+  }
+  window.__minimalSetServer = function (slug) {
+    var list = window.__MINIMAL_SERVERS || [];
+    for (var n = 0; n < list.length; n++) if (list[n].slug === slug) {
+      window.__MINIMAL_SERVER = list[n];
+      try { localStorage.setItem(SERVER_PICK_KEY, slug); } catch (e) {}
+      return true;
+    }
+    return false;
+  };
+
   // ── which client this install serves at / ────────────────────────────────
   // An install can carry BOTH forks: ClassicUO here and TazUO at /tuo/. The admin panel picks which
   // one a bare visit to / lands on; both stay reachable by explicit URL whatever it says.
