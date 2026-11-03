@@ -4,6 +4,10 @@ name: Docker images
 #   ghcr.io/<owner>/<repo>-client | -proxy | -nginx
 # The Dockerfile clones this repository itself, at the ref that triggered the run (branch or tag),
 # so the images always match the pushed source.
+#
+# On a push only the targets whose folders changed are rebuilt (dorny/paths-filter in the `changes`
+# job); tags and manual runs always build all four. An image that is skipped keeps its previous
+# :latest / :<branch> tag, which still matches its own sources.
 
 on:
   push:
@@ -11,23 +15,94 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-concurrency:
-  group: docker-images-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  build:
+  changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            # Anything that changes how every image is built.
+            common: &common
+              - Dockerfile
+              - .github/workflows/docker-images.yml
+              - global.json
+            client:
+              - *common
+              - source/cuo/**
+              - source/vendor/**
+              - source/webclient/minimal-www/**
+              - source/webclient/shared-www/**
+              - source/webclient/native-shims/**
+              - source/webclient/wasm-fna-native*.targets
+              - source/webclient/classicuo-wasm/**
+              - server/scripts/**
+            client-tuo:
+              - *common
+              - source/tuo/**
+              # build.sh checks the FileEmbed submodule under source/cuo for both clients
+              - source/cuo/external/**
+              - source/vendor/**
+              - source/webclient/minimal-www/**
+              - source/webclient/shared-www/**
+              - source/webclient/native-shims/**
+              - source/webclient/wasm-fna-native*.targets
+              - source/webclient/tazuo-wasm/**
+              - server/scripts/**
+            proxy:
+              - *common
+              - server/src/**
+              - server/scripts/**
+              - server/package*.json
+              - server/tsconfig.json
+            nginx:
+              - *common
+              - server/deploy/**
+
+      # Tags and manual runs build everything; a push builds only what the filter flagged.
+      - id: matrix
+        env:
+          FORCE_ALL: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') }}
+          CLIENT: ${{ steps.filter.outputs.client }}
+          CLIENT_TUO: ${{ steps.filter.outputs.client-tuo }}
+          PROXY: ${{ steps.filter.outputs.proxy }}
+          NGINX: ${{ steps.filter.outputs.nginx }}
+        run: |
+          targets=()
+          [ "$FORCE_ALL" = true ] || [ "$CLIENT" = true ]     && targets+=(client)
+          [ "$FORCE_ALL" = true ] || [ "$CLIENT_TUO" = true ] && targets+=(client-tuo)
+          [ "$FORCE_ALL" = true ] || [ "$PROXY" = true ]      && targets+=(proxy)
+          [ "$FORCE_ALL" = true ] || [ "$NGINX" = true ]      && targets+=(nginx)
+          json=$(printf '%s\n' "${targets[@]}" | jq -R . | jq -sc 'map(select(length>0))')
+          echo "matrix=$json" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    # Per target rather than per workflow: with path filtering, a later push that only touches nginx
+    # must not cancel the still-running client build of the previous push, because nothing would
+    # rebuild the client afterwards.
+    concurrency:
+      group: docker-images-${{ github.ref }}-${{ matrix.target }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        target: [client, client-tuo, proxy, nginx]
+        target: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
